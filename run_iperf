@@ -1,0 +1,299 @@
+#!/usr/bin/perl
+#
+# Run iperf and tcpdump for network stress testing
+
+# Copyright (C) 2016  Jon Meek
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=head1 Operational Notes
+
+Run usual (for this tool set) TCP test
+
+On the receiver side:
+
+ sudo run_iperf --rcv --prefix t
+
+wait for the receiver process to start (it will announce that it is
+listening on TCP port 3000)
+
+then on the sender (for default 10 TCP streams):
+
+ sudo run_iperf --prefix t --target x.x.x.x
+
+For fewer TCP streams use -P option:
+
+ sudo run_iperf --prefix t -P 5 --target x.x.x.x
+
+ sudo run_iperf --prefix t -P 3 --target x.x.x.x
+
+Upon test completion the sender side command will complete, the receiver side must be terminated with a Control-C.
+Both the sender and receiver sides will provide the analysis command. A sample:
+
+ To analyze:
+
+  tcpd_read -b 1 -r t10-10.71.46.50-rcv.tcpd --tcpdump 'dst port 3000'
+
+or, the faster, task specific C++ iperfsum:
+
+  iperfsum --filter 'dst port 3000' -r t10-10.71.46.50-rcv.tcpd
+
+
+
+UDP test, receiver side, the value for --udp is ignored on the receiver side:
+
+ sudo run_iperf --rcv --prefix t --udp 10M
+
+Client side, 25 Mbps output rate:
+
+ sudo run_iperf --prefix t --target 192.168.205.47 --udp 25M
+
+
+=cut 
+
+# : pnlbns1:/usr2/data/pcp ; ~/lab/net/run_iperf --rcv --file pcp7
+
+#:     bns2:/usr2/data/pcp ; ~/lab/net/run_iperf --snd --target pnlbns1 --file pcp7
+
+
+# tcpd_read -b 1 -r pcp18.10.221.208.38.snd.tcpd --tcpdump 'src 10.221.208.38'
+
+#$IPERF = '/usr/local/bin/iperf162';
+
+$SUDO = 'sudo'; # Default, could be pbrun
+
+$IPERF = '/usr/local/bin/iperf';
+#$IPERF = 'iperf';  # iperf needs to be in user's path
+
+$TCPDUMP = '/usr/sbin/tcpdump';
+
+$Port = 3000;
+$SnapSize = 100;
+$Threads = 10;
+$Time = 30;
+$Interface = 'eth0';
+$DumpFile = 'iperf';
+$tcpdFilter = qq{port $Port or icmp};
+
+use Getopt::Long;
+use Sys::Hostname;
+use Socket;
+
+$Debug = 1;
+
+GetOptions(
+    "snd" => \$Sender,
+    "rcv" => \$Receiver,
+    "pbrun" => \$Use_pbrun,
+
+#	   "ns" => \$NoStartIperf, # --rcv and iperf server already running
+    "target=s" => \$Target, # Also sets $Sender
+    "i=s" => \$Interface,
+    "port=i" => \$Port,
+    "s=i" => \$SnapSize,
+    "P=i" => \$Threads,
+    "t=i" => \$Time,
+    "file=s" => \$DumpFile,
+    "f=s" => \$DumpFile,
+    "prefix=s" => \$FilePrefix,
+    "mss=i" => \$MaxSegmentSize,
+    "udp=s" => \$UDPrate,  # Rate is only meaningful for sender, but use one option on both sides
+);
+
+$SUDO = 'pbrun' if $Use_pbrun;
+
+$Sender++ if ($Target); # To eliminate need to put --snd on command line
+
+if ($Sender && $Receiver) {
+  die "We can't be both a Sender and a Receiver at the current time\n";
+}
+
+$SIG{INT} = \&catch_int; # Cntrl-C shutdown
+
+sub catch_int {
+  print "$0 Interrupted by Cntrl-C...\n";
+  close IPERF;
+  $termCMD = qq{$SUDO kill -TERM $tcpdumpPID};
+  system($termCMD);
+#  kill 'TERM', $tcpdumpPID;
+
+  if ($Receiver && (defined $SourceAddressFromIperf)) {
+    $FinalFilename = qq{$DumpFile-$SourceAddressFromIperf-rcv.tcpd};
+    $mvCMD = qq{$SUDO mv $tcpdFileName $FinalFilename};
+    print "$mvCMD\n";
+    system($mvCMD);
+    print "To analyze:\ntcpd_read -b 1 -r $FinalFilename --tcpdump 'dst port $Port'\n";
+  }
+
+  print "Exiting\n";
+  exit;
+}
+
+if ($FilePrefix) {
+  use File::Find;
+  $BaseDir = q{./} unless $BaseDir; # Default is current directory
+
+  sub GetHighTestNumber {
+    $rdfile = $File::Find::name; # Full path
+    $file_name = $_;             # Just the filename
+
+#    print "$count  File: $rdfile  $file_name\n";
+    return if (-d $rdfile);                  # Skip directories
+    return unless ($file_name =~ /\.tcpd$/); # Just take tcpdump files
+
+    $file_name =~ /^$FilePrefix(\d+)/;
+    $file_number = $1;
+#    print "   $file_number\n";
+
+    $HighTestNumber = $file_number if ($file_number > $HighTestNumber);
+
+  }
+
+  $HighTestNumber = 0;
+  find(\&GetHighTestNumber, $BaseDir, $FilePrefix);
+
+  $NextTestNumber = $HighTestNumber + 1;
+  print "NextTestNumber: $NextTestNumber\n";
+
+  $DumpFile = qq{$FilePrefix$NextTestNumber};
+}
+
+if (!$Sender && !$Receiver) {
+  $usage = qq{Run iperf and tcpdump for network stress test
+
+Automatic test number incrementing:
+
+ sudo run_iperf --prefix t --rcv
+ sudo run_iperf --prefix t --target 57.72.193.35
+
+Be sure to start the --rcv process first.
+
+Manually incrementing the file names:
+
+ sudo run_iperf --rcv --file t1
+ sudo run_iperf --snd --target 57.72.193.35 --file t1
+
+ };
+
+  print $usage;
+  exit;
+}
+
+if ($Sender) {
+  $hostname = hostname;
+  $ipaddr = gethostbyname($hostname);
+  $SourceAddress = inet_ntoa($ipaddr);
+  if ($SourceAddress eq '127.0.0.1') {
+    print "Warning: the IP address of this system appears as 127.0.0.1\n";
+    print "         for consistent packet file naming, adjust /etc/hosts\n";
+  }
+
+  $tcpdFileName = qq{$DumpFile-$SourceAddress-snd.tcpd};
+  print "$hostname - $SourceAddress - $tcpdFileName\n";
+#  exit;
+}
+
+if ($Receiver) {
+  $tcpdFileName = qq{$DumpFile.tcpd};
+}
+
+
+#$tcpdFileName = qq{$DumpFile.tcpd} unless ($DumpFile =~ /\.tcpd$/);
+
+$tcpdumpCmd = qq{$SUDO $TCPDUMP -i $Interface -s $SnapSize -w $tcpdFileName $tcpdFilter};
+
+ FORK:
+  if ($tcpdumpPID = fork) {
+    # parent here
+    # child process pid is available in $tcpdumpPID
+#    waitpid($tcpdumpPID,0);
+#    $returnstatus = ($? >> 8);
+  } elsif (defined $tcpdumpPID) { #pid is zero here if defined
+    # child here
+
+    # Form our exec() string using our temp file.
+
+    print STDERR "tcpdumpCmd: $tcpdumpCmd\n" if $Debug;
+    exec("$tcpdumpCmd");
+
+    # parent process pid is available with getppid
+  } elsif ($! =~ /No more process/) {
+
+    # EAGAIN, supposedly recoverable fork error
+    sleep 2;
+    redo FORK;
+  } else {
+    # weirdo fork error
+    die "fork problen\n";
+  }
+
+
+print "tcpdump started\n" if $Debug;
+
+###################################################################
+
+#
+# Receiver
+#
+if ($Receiver) {
+
+  $iperfCmd = qq{$IPERF -s -p $Port};
+  $iperfCmd .= q{ -u} if $UDPrate;
+  print "iperf: $iperfCmd\n" if $Debug;
+
+  open(IPERF, "$iperfCmd |");
+  while ($in = <IPERF>) {
+    if ((!defined $SourceAddressFromIperf) && ($in =~ /connected with\s+(.*?)\s+port/)) {
+      $SourceAddressFromIperf = $1;
+      print "Source: $SourceAddressFromIperf\n" if $Debug;
+    }
+    print $in;
+  }
+
+}
+
+###################################################################
+
+#
+# Sender
+#
+if ($Sender) {
+
+  $mss = '';
+  $mss = qq{--mss $MaxSegmentSize} if ($MaxSegmentSize);
+
+  if ($UDPrate) {
+    $iperfCmd = qq{$IPERF -p $Port $mss -t $Time -c $Target -u -b $UDPrate };
+  } else {
+    $iperfCmd = qq{$IPERF -p $Port $mss -t $Time -c $Target -P $Threads };
+  }
+  print "iperf: $iperfCmd\n" if $Debug;
+  print "iperf: $iperfCmd\n";
+#  system($iperfCmd);
+
+  open(IPERF, "$iperfCmd |");
+  while ($in = <IPERF>) {
+    print $in;
+  }
+
+  close IPERF;
+#  kill 'TERM', $tcpdumpPID;
+
+  $termCMD = qq{$SUDO kill -TERM $tcpdumpPID};
+  system($termCMD);
+
+  print "To analyze:\ntcpd_read -b 1 -r $tcpdFileName --tcpdump 'dst port $Port'\n";
+
+}
+

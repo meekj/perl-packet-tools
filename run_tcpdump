@@ -1,0 +1,381 @@
+#!/usr/bin/perl
+#
+
+# Stop running copy of tcpdump, start a new one, remove old logs
+
+# Jon Meek, Sep 1999
+
+# Caution, this is not working cleanly on Solaris, kill is not doing the job
+
+# Copyright (C) 2016  Jon Meek
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=head1 Notes
+
+__END__
+
+Typical configuration file (tcpd_run.cfg):
+ 
+# Configuration file for Linux based system
+#
+LogDir /usr2/tcpd
+PIDfile /usr2/tcpd/tcpdump.pid
+Compress /usr/bin/gzip
+Interface eth0
+tcpdump /usr/sbin/tcpdump
+tcpdumpFilter host 192.168.248.31 or host 192.168.248.32 or host 192.168.227.161
+SnapLength 150
+DaysToKeep 4.6
+ReportProgram /home/meekj/bin/tcpd_read --rh6 -r
+ReportDir /home/httpd/html/cdim
+ReportSuffix .txt
+
+Typical cron entry:
+
+0,15,30,45 * * * * /home/meekj/bin/tcpd_run -c /home/meekj/tcpd_run.cfg > /dev/null
+
+ReportProgram /usr/local/bin/tcpd_read --filtermodule /usr/local/bin/tcpanal.pm --quiet -r 
+ReportDir /srv/www/htdocs/gbonet
+ReportFileTemplate z5-gbo_rtt.YYYYMMDD
+ReportSuffix .txt
+
+
+=cut
+
+
+$RCSid = q{$Id: run_tcpdump,v 1.1 2016/04/13 02:25:19 meekj Exp $ };
+
+use Getopt::Std;
+use File::Find;
+
+getopts('lfdc:');
+
+#
+# Set defaults
+#
+$ConfigOption{logdir} = '.';
+$ConfigOption{pidfile} = 'tcpdump.pid';
+$ConfigOption{compress} = 'gzip';
+$ConfigOption{interface} = 'eth0';
+$ConfigOption{tcpdump} = 'tcpdump';
+$ConfigOption{tcpdumpfilter} = '';
+#$ConfigOption{tcpdumpflags} = '-p'; # Needed for bogus versions of tcpdump in RH 6.2-7.1
+$ConfigOption{tcpdumpflags} = '';
+$ConfigOption{snaplength} = 200;
+$ConfigOption{daystokeep} = 9.2;
+#$ConfigOption{percentdiskfree} = 20.0
+$ConfigOption{reportprogram} = '';
+
+#
+# Read the configuration file
+#
+if ($opt_c) {
+  $ConfigFile = $opt_c;
+} else {
+  $ConfigFile = 'tcpd_run.cfg'
+}
+
+if (open(C, $ConfigFile)) {
+  while ($in = <C>) {
+    next if ($in =~ /^\#/);
+#    print $in;
+    chomp $in;
+    ($tag, $val) = split(' ', $in, 2);
+    $tag = lc $tag; # force to lowercase
+    $ConfigOption{$tag} = $val;
+  }
+} else {
+  warn "Couldn't open $ConfigFile, using defaults\n";
+}
+
+#
+# Set working variables
+#
+$SNAP_LEN = $ConfigOption{snaplength};
+$DAYS_TO_KEEP = $ConfigOption{daystokeep};
+$LOG_DIR = $ConfigOption{logdir};
+$PID_FILE = $ConfigOption{pidfile};
+$GZIP = $ConfigOption{compress};
+$INTERFACE = $ConfigOption{interface};
+$TCPDUMP = $ConfigOption{tcpdump};
+#  $tcpdFilter = "'net 10.245'";
+$tcpdFilter = $ConfigOption{tcpdumpfilter};
+$tcpdFlags = $ConfigOption{tcpdumpflags};
+$ReportProgram = $ConfigOption{reportprogram};
+$ReportDir = $ConfigOption{reportdir};
+$ReportSuffix = $ConfigOption{reportsuffix};
+$ReportFileTemplate = $ConfigOption{reportfiletemplate} if (defined $ConfigOption{reportfiletemplate});
+
+# ReportFileTemplate is valid only if it contains YYYYMMDD
+
+
+if (length($tcpdFilter) > 0) { # Tack on leading and trailing 's
+  $tcpdFilter = "'" . $tcpdFilter . "'";
+}
+
+if ($opt_d) {
+print "Config:
+  SNAP_LEN      $SNAP_LEN
+  DAYS_TO_KEEP  $DAYS_TO_KEEP
+  LOG_DIR     $LOG_DIR
+  PID_FILE    $PID_FILE
+  GZIP        $GZIP
+  INTERFACE   $INTERFACE
+  TCPDUMP     $TCPDUMP
+  tcpdFilter  $tcpdFilter
+\n";
+
+#exit;
+}
+
+if ($opt_l) { # List configuration and exit
+  print "tcpd_run Configuration
+
+ Programs to use:
+  Packet Capture  $TCPDUMP
+  Compression     $GZIP
+  Reporting       $ReportProgram
+
+  Report Directory   $ReportDir
+  Report File Suffix $ReportSuffix
+
+ Disk space related parameters:
+  Log Directory              $LOG_DIR
+  Packet Capture PID File    $PID_FILE
+  Bytes per Packet           $SNAP_LEN
+  Days to Keep Files         $DAYS_TO_KEEP
+  Percent Disk to Keep Free  $ConfigOption{percentdiskfree}
+
+ Packet capture related parameters:
+  Capture Interface   $INTERFACE
+  Capture Flags       $tcpdFlags
+  Capture Filter      $tcpdFilter
+\nExiting, not starting packet capture\n";
+
+  exit;
+}
+
+
+#
+# Get list of files in the current packet log directory
+#
+
+print "Checking existing files\n" if $opt_d;
+
+find(\&wanted, $LOG_DIR);
+
+sub wanted {
+  my ($rdfile);
+  $rdfile = $File::Find::name;
+  return if (-d $rdfile);
+  push(@Files, $rdfile);
+  $AgeByFile{$rdfile} = -M $rdfile;
+  $SizeByFile{$rdfile} = -s $rdfile;
+}
+
+#
+# Delete by file age first
+#
+if ($DAYS_TO_KEEP > 0) {
+  foreach $f (sort @Files) { # Switch this to the %AgeByFile hash later
+    $age = -M $f;
+    if ($age > $DAYS_TO_KEEP) {
+      print "Delete due to age: $f  $age\n" if $opt_d;
+      unlink $f;
+    }
+    #  print "$f  $age\n";
+  }
+}
+
+#
+# Don't attempt to use Filesys::Df unless it is needed
+#
+if (exists $ConfigOption{percentdiskfree}) {
+
+  $PercentDiskFree = $ConfigOption{percentdiskfree};
+
+  print "Attempt to load Filesys::Df\n" if $opt_d;
+  eval "use Filesys::Df";
+  do {
+    warn "Couldn't load Filesys::Df $@";
+    delete $ConfigOption{percentdiskfree};
+  } unless ($@ eq '');
+
+  my $ref = df($LOG_DIR);	# Default block size of 1024 bytes.
+
+  $TotalDiskSpace = $ref->{blocks} * 1024;
+  $PercentFree = 100 - $ref->{per};
+  $PercentNeeded = $PercentDiskFree - $PercentFree;
+  $PercentNeeded = 0 if ($PercentNeeded < 0);
+
+  if ($opt_d) {
+    print "Percent Full:       $ref->{per}\n";
+    print "Total Blocks:       $ref->{blocks}\n";
+    print "Blocks Available:   $ref->{bavail}\n";
+    print "Blocks Used:        $ref->{used}\n";
+    print "Inode Percent full: $ref->{fper}\n";
+    print "Inodes Free:        $ref->{favail}\n";
+    print "Inodes Used:        $ref->{fused}\n";
+    print "Total Bytes:        $TotalDiskSpace\n\n";
+
+    print "PercentFree         $PercentFree\n";
+    print "PercentNeeded       $PercentNeeded\n";
+    print "\n";
+    print "\n";
+
+  }
+}
+
+if (exists $ConfigOption{percentdiskfree}) { # Check again, if Filesys::Df did not exist we don't want to do this
+
+  if ($PercentNeeded > 0) {
+    #    $BytesToFree = 1024 * $PercentNeeded * $TotalDiskSpace / 100;
+    $BytesToFree = $PercentNeeded * $TotalDiskSpace / 100;
+    print "Need to free $BytesToFree bytes\n" if $opt_d;
+
+    $DeleteSize = 0;
+    $BytesLeftToFree = $BytesToFree;
+    foreach $f (sort {$AgeByFile{$b} <=> $AgeByFile{$a}} keys %AgeByFile) {
+      next unless (-e $f);  # May have already been deleted due to age
+      #    if ($DeleteSize < $BytesToFree) {
+      if ($BytesLeftToFree > 0) {
+	printf "Delete due to disk space: %s  %4.1f %9d %14.0f\n",
+	  $f,  $AgeByFile{$f}, $SizeByFile{$f}, $BytesLeftToFree;
+
+	#      $DeleteSize += $SizeByFile{$f};
+	$BytesLeftToFree -= $SizeByFile{$f};
+	unlink $f;
+      } else {
+
+	printf "Not deleting due to disk space: %s  %4.1f %9d %14.0f\n",
+	  $f,  $AgeByFile{$f}, $SizeByFile{$f}, $BytesLeftToFree;
+
+      }
+    }
+  }
+}
+
+#exit;
+
+#
+# Restart tcpdump
+#
+if ((-e $PID_FILE) && (-s $PID_FILE)) { # Ignore zero length PID file (possibly due to disk space problem)
+  print "PID File Exists\n" if $opt_d;
+
+  open(PID, $PID_FILE);
+  $PrevPID = <PID>;
+  $PrevFile = <PID>;
+
+  chomp $PrevPID;
+  chomp $PrevFile;
+#  $RetVal = system("kill -TERM $PrevPID");
+#  $PrevPID = -1 * $PrevPID;
+
+#  print "Killing  $PrevPID\n";
+
+##  $RetVal = kill 15, $PrevPID;
+#  $RetVal = kill 2, $PrevPID; # Don't stop tcpdump here, wait until new instance is running
+
+  close PID;
+  unlink $PID_FILE;
+}
+
+if ($opt_f) { # Don't start a new tcpdump if -f
+  print "-f Specified, not starting a new tcpdump\n" if $opt_d;
+  print "Killing  $PrevPID\n" if $opt_d;
+  $RetVal = kill 2, $PrevPID if (defined $PrevPID); # Kill old tcpdump, if we have the PID
+  &ReportAndCompress($PrevFile) if (-e $PrevFile);
+  exit;
+}
+
+$date_time = &ISOdate;
+$tcpdFileName = "$LOG_DIR/$date_time.tcpd";
+
+print "Date: $date_time - $tcpdFileName\n" if $opt_d;
+
+
+$StartCmd = "$TCPDUMP -i $INTERFACE -s $SNAP_LEN $tcpdFlags -w $tcpdFileName $tcpdFilter";
+
+print "$StartCmd\n" if $opt_d;
+
+unless (fork) { #       this is the child
+  open(PID, ">$PID_FILE"); # Write the PID to a file
+  print PID "$$\n";
+  print PID "$tcpdFileName\n";
+  close PID;
+  $Result = exec $StartCmd;
+  print "exec result: $Result\n" if $opt_d;
+}
+
+print "Killing  $PrevPID\n" if $opt_d;
+$RetVal = kill 2, $PrevPID if (defined $PrevPID); # Kill old tcpdump, if we have the PID
+
+&ReportAndCompress($PrevFile) if (-e $PrevFile);
+
+#
+# ##### Subroutines ######
+#
+
+sub ReportAndCompress {
+  my($File) = @_;
+
+  print "ReportAndCompress: $File\n";
+
+  if (length($ReportProgram) > 1) { # Run the report if specified
+    $report_prog_string = qq{$ReportProgram $File};
+
+    if ($ReportFileTemplate =~ /YYYYMMDD/) { # Daily file
+      $File =~ /(\d{8})\d{4}\D+$/; # Get a number from the end of the filename
+      $YYYYMMDD = $1;
+      $ReportFileTemplate =~ s/YYYYMMDD/$YYYYMMDD/; # Fill in current year, month, and date
+      $report_file = qq{$ReportDir/${ReportFileTemplate}$ReportSuffix};
+
+    } else { # Individual files
+      $File =~ /(\d+)\.tcpd$/;
+      $file_date_time = $1;
+      $report_file = qq{$ReportDir/${file_date_time}$ReportSuffix};
+    }
+    # print " $report_prog_string\n";
+    $sys_result = open($PROG, "$report_prog_string |");
+    # print " sys_result: $sys_result\n";
+    $Result = '';
+    while ($in = <$PROG>) {
+      # print $in;
+      $Result .= $in;
+    }
+    close $PROG;
+    open($REPORT, ">>$report_file");
+    print $REPORT $Result;
+    close $REPORT;
+#    $sys_result = system($report_prog_string);
+#    print " sys_result: $sys_result\n";
+  }
+
+  system("$GZIP $File"); # if (-e $File); # Compress the data file
+}
+
+sub ISOdate { # Get time & date, put into ISO format
+    local ($sec, $min, $hour, $day, $mon, $year,
+	   $wday, $yday, $isdat, $isodate);
+    ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdat)
+      = localtime(time);
+    $mon++; # month is zero-based
+    $year += 1900;
+    $isodate =
+      sprintf("%04d%02d%02d%02d%02d",
+	      $year, $mon, $day, $hour, $min);
+}
+

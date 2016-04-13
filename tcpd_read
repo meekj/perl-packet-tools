@@ -1,0 +1,3060 @@
+#!/usr/bin/perl
+#
+# Read 'tcpdump -w file' (libpcap) files and display interesting data about the packets
+#
+# The default output is a concise summary of the traffic contained in the packet capture
+#  For default output:  tcpd_read file.tcpd
+#  To see options:      tcpd_read -h
+#
+# Custom "FilterModules" can be written to do things not currently supported
+#
+# This program is not complete, but it may be useful in conjunction with other tools, such as tshark.
+#
+# Jon Meek, 01-Jan-1998 -> 2016
+#
+# See libpcap header file and R. Stevens "TCP/IP Illustrated Vol. 1"
+#
+
+# Copyright (C) 2016  Jon Meek
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Optional Perl Modules - required for some options, listed in approximate order of likely need:
+
+#  Net::DNS                - However, we don't decode DNS very well
+#  Digest::MD5             - Used to detect repeated payloads
+#  Statistics::Descriptive - Used for --dnsaudit DNS response times
+#  Convert::EBCDIC         - Left over from the AS/400 era
+
+
+$RCSid = q{$Id: tcpd_read,v 1.93 2016/04/10 18:05:39 meekj Exp $ };
+
+=head1 NAME
+
+B<tcpd_read> - Extended intrepretation and analysis of packets
+captured by tcpdump.
+
+=head1 SYNOPSIS
+
+B<tcpd_read --r single_input_file --v -l --quiet --skip n --process n --t n --md5 n --sqlnet --dirsum --rh6 --tcp_endt_sort --abseq -D --hex --bandwidth n --biso --bwfile file --wstream dir --fri fri_file --pktsum pkt_file --pktplt --pktdb file --ebcdic --fddi --clkpkt --tz zone --dnsaudit --tcpdump filter_exp --regexp string --filtermodule perl_module --fmargs string> input_file_list
+
+B<tcpd_read -r file -v -l -s n -p n -t n -M n -S -A -D -x -b n -w dir -F fri_file -G pkt_file>
+
+=head1 DESCRIPTION
+
+This program is intended to supplement tcpdump, not replace
+it. Tcpdump is required to capture packets, and tcpdump B<-r> should be
+used to examine captured data in addition to this program.
+
+Other widely used programs for dealing with tcpdump files include
+WireShark (and tshark), and tcptrace. In general, those
+programs should be your first choice unless you find features here
+that you require, or if you wish to add a custom feature in perl.
+
+Running 'tcpd_read capture.tcpd' will provide a summary of the TCP
+sessions, and UDP traffic in the file. That information could be used
+to form a filter expression for use with other programs (i.e using a
+source port number to select a single TCP session of interest).
+
+This program provides "better" formatting for some types of data
+output, but it does not handle every type of packet that tcpdump
+itself does. This program is capable of providing more detail for some
+types of packets.
+
+Note that this program is written in pure Perl and can be slow for
+large packet captures.  Computing per-second summary data (packet
+counts, throughput, etc) is about 7x faster using iperfsum (written in
+C++).
+
+In addition to the features covered in the OPTIONS section, tcpd_read
+has the following features:
+
+=over 4
+
+=item *
+
+DHCP packets are decoded in detail. If DHCP/BOOTP packets are seen in
+a packet capture trace, then a summary section lists all DHCP/BOOTP
+servers that replied to requests. This is useful for tracking down
+problems related to rogue DHCP servers.
+
+=item *
+
+At the end of each program run, a summary is printed containing:
+
+Date/Time range covered
+
+Elapsed time
+
+Total bytes and total data bytes
+
+Packets by protocol, with number of packets, number of bytes and
+percent of total by size(?).
+
+A list of all TCP sessions seen and the number of packets in each
+session.
+
+=item *
+
+Basic information is provided about UDP packets and, if they are
+recognized by the program, additional information is printed.
+
+=back
+
+=head1 OPTIONS
+
+=over 5
+
+=item B<-r file>
+
+Read tcpdump packets from file. Can also read from
+standard input via pipe for realtime use, see example below.
+
+The -r flag is optional, the filename can simply be the final argument.
+
+=item B<-v>
+
+Verbose, print data on all packets, otherwise just the
+summary is provided.
+
+=item B<--quiet>
+
+Quiet, print minimal, or no summary information. Use when a FilterModule
+Module output is all that is needed.
+
+=item B<--clkpkt>
+
+Show clock time on each packet when -v is set. Time zone defaults
+to that currently set in the environment.
+
+=item B<--tz>
+
+Set the time zone for a run of the program (GMT, EDT, CET, etc).
+
+
+=item B<-l>
+
+Show printable characters in packet payload. Unprintable characters
+are shown as '.'. If the whole packet is not available (because of a
+snap length setting) then '(...)' is placed at the end of the printed
+data.
+
+=item B<--tcpdump filter_exp>
+
+Use a libpcap expression to pre-filter the data. This option actually
+uses tcpdump which must be in the user's path (and allowed to be run
+as a non-root user for reading a file). A filter expression containing
+whitespace must be quoted.
+
+
+=item B<--ebcdic> or B<-E>
+
+When used with B<-l> will convert payload from EBCDIC to ASCII before
+showing printable characters.
+
+=item B<--skip n> or B<-s n>
+
+Skip n packets before starting analysis, or other output.
+
+=item B<--process n> or B<-p n>
+
+Process only n packets.
+
+=item B<-t n>
+
+Offset time by n seconds. Usually used to simplify the
+analysis of packet traces taken at two different points in the
+network. This option will eliminate the need to precisely start two
+copies of tcpdump at the same instant when performing debugging that
+requires monitoring in two parts of a network. Note that the preferred
+time synchronization technique is to use NTP on all systems and print
+packet information using clock time.
+
+=item B<--md5 n> or B<-M n>
+
+Use MD5 digital signature of each packet to track data
+payloads with identical content. Only packets with more than n bytes
+of data are included. The B<-S> (snap length) option of tcpdump should be
+used to capture enough data to make the digital signature
+meaningful. With snaplen set to 1512 all of the data in an Ethernet
+packet will be captured.
+
+=item B<--sqlnet> or B<-S>
+
+Attempt to decode SQL*Net packet headers. Will only work
+if the SQL*Net header starts at the beginning of a TCP packet
+payload.
+
+=item B<-A>
+
+Show absolute sequence and acknowledgement numbers in the
+output. Otherwise, relative sequence numbers are shown in order to
+simplify intrepretation. Requires B<-v>.
+
+=item B<--hex> or B<-x>
+
+Show packet data in hexadecimal.
+
+=item B<--bandwidth n> or B<-b n>
+
+Print bandwidth used by captured packets in n seconds
+intervals. Includes packets, bytes, initial SYNs, first FIN or RST in
+a session.
+
+=item B<--biso>
+
+Print time in the bandwidth report section in ISO8601 format rather
+than relative seconds. Useful for comparison with other types of data
+or plots with date/time on the X axis. This format is compatible with
+the xmgrace data analysis and plotting program.
+
+=item B<-w dir>
+
+Write each data stream (payload only) to a file in the directory
+dir. Multiple files will be written, one for each session and
+direction. This works for TCP only. Consider using Ethereal for this
+task.
+
+=item B<-G file>
+
+Write a summary line for each packet to file. The file can be used for further
+analysis. Often used to study congestion problems.
+
+=item B<--pktplt>
+
+Print packet data for plots. Currently this is a time
+stamp and the size of the packet. Each session and direction are
+listed separately.
+
+=item B<--dnsaudit>
+
+Produce a summary report listing DNS Question packets without answers
+in the packet capture, and Ansewr packets without an associated
+Question. Might be used to find DNS answers that have been routed to
+the wrong place. There will, of course, be some packets reported near
+the beginning and end of a packet capture stream that are not really a
+problem, since their partner packet might not have been recorded.
+
+
+=item B<--regexp string>
+
+When using the -v and -l flags, print only packets that match the Perl
+regular expression. There is currently no mechanism to set regexp
+flags, such as case insensitivity.
+
+=item B<--filtermodule perl_module>
+
+Specify a Perl module to provide custom analysis of packets and to
+determine what packets are printed with -v and -l. An example will be
+provided once the data passing sequence is finalized. The full path to
+the Perl module should be specified. Do NOT include the .pm suffix in
+the perl_module string.
+
+=item B<--fmargs argument_string>
+
+A string that is passed to the filtermodule on initialization. It is
+up to the filtermodule to decode this string. Typically this is a
+comma separated of key=value pairs. Note that the string may need to
+be quoted to avoid shell interpretation.
+
+=item B<--countdup>
+
+Count packets that appear to be duplicates (same Session Number,
+Sequence Number, and IP ID). Needs further testing, but does
+agree with tcptrace on some files.
+
+=back
+
+=head1 EXAMPLES
+
+Simple session summary:
+
+ tcpd_read -r file.tcpd
+
+Show packet details and printable payload:
+
+ tcpd_read -r file.tcpd -v -l
+
+tcpd_read can accept tcpdump output via a pipe. This is most useful
+when a semi-realtime look at data streams is needed and there is no
+need to save the packet trace.
+
+ tcpdump -i le0 -w - host www1 and port listener | tcpd_read -v -r -
+
+ sudo sh -c "tcpdump -i eth0 -l -w - -s 400 ip | tcpd_read --rh6 -v -l -r -"
+
+Cntrl-C / SIGINT will cause program to terminate and summary to be printed
+
+=head1 FILTER MODULES
+
+A "filter module" allows the packet analyst to do just about anything
+with packet data, such as build up sessions based on an http cookie,
+look for corrupted data, load a database with packet information, etc.
+
+It would be a bad idea to modify any of the hash data within the
+"filter module" code.
+
+A very simple skeleton "filter module" looks like this:
+
+ package tcpdFilterModule;
+ #
+ # Module to provide "Filter Modules" for tcpd_read
+ #
+
+ # Variables to retain during tcpd_read execution
+ # collect data for a final report
+ my %SessionData = ();
+ my %fmArg = (); # Module arguments as decoded by fmInit
+
+ # Perl module stuff
+ #
+ use Exporter();
+ $VERSION = 0.01;
+ @ISA = qw(Exporter);
+ @EXPORT = qw(fmInit fmTCPpacket fmUDPpacket fmICMPpacket fmListResults);
+
+ #
+ # Initialize the FilterModule, possibly a database connection
+ #
+
+ sub fmInit {
+   my ($ArgString) = @_;
+   my (@argPairList, $arg, $key, $val);
+   # Do something related to filter initialization, may pass args later
+
+   #
+   # Parse comma separated kye=value pairs
+   #
+   (@argPairList) = split(/,/, $ArgString);
+   foreach $arg (@argPairList) {
+     ($key, $val) = split(/=/, $arg);
+     $fmArg{$key} = $val;
+     print "$key = $val\n";
+   }
+
+   # Do something related to filter initialization
+ }
+
+ #
+ # Handler for TCP packets
+ #
+ sub fmTCPpacket { # tcpd_read passes us all packet parameters,
+                   # and some derived values in pointers to hashes
+
+  my ($PktHeader, $PktMeta, $PktLink, $PktIP, $PktTCP) = @_;
+
+ #
+ # Data initialization
+ #
+  my $ReturnVal = 0;
+
+ # Do something with the packet data, set $ReturnVal = 1 if the packet should be printed by tcpd_read
+ # Possibly place information in %SessionData
+  my $Payload = $PktTCP->{data};
+  my $SKey = $PktMeta->{sessionkey}; # Normalized session key to ID Source/Dest IP/Port tuples
+  $SessionData{$SKey} .= $Payload;
+
+  return $ReturnVal;
+ }
+
+ #
+ # Handler for UDP packets
+ #
+ sub fmUDPpacket { # tcpd_read passes us all packet parameters,
+                   # and some derived values in pointers to hashes
+
+  my ($PktHeader, $PktMeta, $PktLink, $PktIP, $PktUDP) = @_;
+
+ #
+ # Data initialization
+ #
+  my $ReturnVal = 0;
+
+ # Do something with the packet data, set $ReturnVal = 1 if the packet should be printed by tcpd_read
+ # Possibly place information in %SessionData
+  my $Payload = $PktUDP->{data};
+  my $SKey = $PktMeta->{sessionkey}; # Normalized session key to ID Source/Dest IP/Port tuples
+  $SessionData{$SKey} .= $Payload;
+
+  return $ReturnVal;
+ }
+
+
+ sub fmICMPpacket {
+  my ($PktHeader, $PktMeta, $PktLink, $PktIP, $PktICMP) = @_;
+
+ #
+ # Data initialization
+ #
+  my $ReturnVal = 0;
+
+ # Do something with the data
+
+  return $ReturnVal;
+
+ }
+
+ sub fmNIPpacket { # Not an IP packet
+  my ($PktHeader, $PktMeta, $PktLink) = @_;
+
+ #
+ # Data initialization
+ #
+  my $ReturnVal = 0;
+
+ # Do something with the data
+
+  return $ReturnVal;
+
+ }
+
+ sub fmOTHERpacket { # Final chance to look at the packet
+  my ($PktHeader, $PktMeta, $PktLink) = @_;
+
+ #
+ # Data initialization
+ #
+  my $ReturnVal = 0;
+
+ # Do something with the data
+
+  return $ReturnVal;
+
+ }
+
+ #
+ # Post analysis report
+ #
+ sub fmListResults {
+  my ($PktHeader) = @_;
+
+  my $k;
+  foreach $k (keys %SessionData) {
+    print "$k  $SessionData{$k}\n";
+  }
+
+ }
+
+ 1;
+
+The following hashes are passed to the appropriate "filter module" subroutines.
+
+tcpdump file header data
+
+ $PktHeader->{magic}
+ $PktHeader->{version_major}
+ $PktHeader->{version_minor}
+ $PktHeader->{thiszone}
+ $PktHeader->{sigfigs}
+ $PktHeader->{snaplen}
+ $PktHeader->{linktype}
+
+ $PktHeader->{file_start_time}   (derived data) not yet implemented
+ $PktHeader->{file_name}         (derived data)
+
+tcpdump Packet Header Data
+
+ $PktMeta->{tv_sec}
+ $PktMeta->{tv_usec}
+ $PktMeta->{caplen}
+ $PktMeta->{len}
+ $PktMeta->{pktnum}       packet number as counted by tcpd_read (derived data)
+ $PktMeta->{pkttime}      (derived data)
+ $PktMeta->{sessionkey}   normalized IP address port string  (derived data)
+
+Link Layer Data
+
+ $PktLink->{ether_dest}
+ $PktLink->{ether_src}
+ $PktLink->{ether_type_or_length}
+ $PktLink->{ether_type}   may be derived
+ $PktLink->{data}
+
+IP Packet Data
+
+ $PktIP->{ver}
+ $PktIP->{hlen}
+ $PktIP->{tos}
+ $PktIP->{len}
+ $PktIP->{id}
+ $PktIP->{flags}
+ $PktIP->{foffset}
+ $PktIP->{ttl}
+ $PktIP->{proto}
+ $PktIP->{cksum}
+ $PktIP->{src_ip}
+ $PktIP->{dst_ip}
+ $PktIP->{options}
+ $PktIP->{data}
+
+ICMP Packet Data
+
+ $PktICMP->{type}
+ $PktICMP->{code}
+ $PktICMP->{cksum}
+ $PktICMP->{data}
+
+UDP Packet Data
+
+ $PktUDP->{src_port}
+ $PktUDP->{dst_port}
+ $PktUDP->{len}
+ $PktUDP->{cksum}
+ $PktUDP->{data}
+ $PktUDP->{datalen}   (derived data)
+
+TCP Packet Data
+
+ $PktTCP->{src_port}
+ $PktTCP->{dst_port}
+ $PktTCP->{seqnum}
+ $PktTCP->{acknum}
+ $PktTCP->{hlen}
+ $PktTCP->{reserved}
+ $PktTCP->{flags}
+ $PktTCP->{winsize}
+ $PktTCP->{cksum}
+ $PktTCP->{urg}
+ $PktTCP->{options}
+ $PktTCP->{data}
+
+ $PktTCP->{urg}   (extracted from flags)
+ $PktTCP->{ack}
+ $PktTCP->{psh}
+ $PktTCP->{rst}
+ $PktTCP->{syn}
+ $PktTCP->{fin}
+
+ $PktTCP->{mss}   (extracted from options)
+ $PktTCP->{wsf}
+
+ $PktTCP->{datalen}      (derived data)
+ $PktTCP->{session_num}  (derived data, only provided for initial SYN, use $PktMeta->{sessionkey})
+ $PktTCP->{timestamps}   (derived data)
+ $PktTCP->{rel_seqnum}   (derived data)
+ $PktTCP->{rel_acknum}   (derived data)
+
+=head1 BUGS
+
+Decoding packets in pure Perl is *slow*. A fast XS packet decode
+library is needed. Based on 2016 work with libpcap and C++ (see
+iperfsum) that might increase performance 5x to 7x.
+
+Features have been added as needed. Therefore, there are missing features.
+
+There might even be some bugs in the features that are included. Users
+should make use of similar tools (some are mentioned above) to
+validate the results of this program for their particular purpose.
+
+The existence of IPv6 packets will be reported, but they are not yet decoded.
+
+=head1 AUTHOR
+
+Jon Meek - meekj [at] ieee.org
+
+Last updated 10-April-2016
+
+=cut
+
+# Global Hashes
+
+my %PktHeader = ();
+my %PktMeta = ();
+
+$REPORT_LINE_LEN = 132; # Break Hex & Text data at this number (evenly divisible by 3)
+$REPORT_LINE_LEN = 141; # Break Hex & Text data at this number (evenly divisible by 3)
+
+# Protocol Constants
+#
+$FILE_HEAD_LENGTH = 24;
+$PACKET_HEAD_LENGTH = 16;
+$LINUX_HEAD_LENGTH = 8; # Extra data that shows up in RedHat 6.1
+$DT_RPT_THRESHOLD = 0;
+
+$ETHER_HEAD_LENGTH = 14;
+
+$MaxPacketSize = 1514; # Assume that we are on Ethernet, used to count full size packets
+
+use POSIX qw(strftime);
+use FileHandle;
+use Getopt::Long;
+use Pod::Usage;
+
+$FilterModuleArguments = '';
+$tcpdumpProg = 'tcpdump';
+
+GetOptions(
+"r=s" => \$opt_r,
+"l" => \$opt_l,
+"v" => \$opt_v,
+
+"quiet" => \$Quiet,
+
+"dirsum" => \$opt_dirsum,
+"nosessionsum" => \$opt_nosessionsum,
+
+"A" => \$opt_A,
+"abseq" => \$opt_A,
+
+"tcp_endt_sort" => \$opt_tcp_endt_sort,
+
+"D" => \$opt_D,
+"S" => \$opt_S,
+"sqlnet" => \$opt_S,
+
+"pktplt" => \$opt_P,
+
+"E" => \$opt_E,
+"ebcdic" => \$opt_E,
+
+"x" => \$opt_x,
+"hex" => \$opt_x,
+
+"i" => \$opt_i,
+
+"fri=s" => \$opt_F,
+"F=s" => \$opt_F,
+
+"G=s" => \$opt_G,
+"pktsum=s" => \$opt_G,
+
+"pktdb=s" => \$opt_pktdb,
+
+"s=i" => \$opt_s,
+"skip=i" => \$opt_s,
+
+"p=i" => \$opt_p,
+"process" => \$opt_p,
+
+"b=i" => \$opt_b,
+"bnz" => \$NoZeroPacketsBW,
+"bandwidth=i" => \$opt_b,
+"biso" => \$IsoTimeBW,
+"bwfile=s" => \$opt_bwfile,
+
+"timeoffset=f" => \$opt_t,
+"t=f" => \$opt_t,
+
+"starts=i" => \$opt_starts,
+"ends=i" => \$opt_ends,
+
+"M=i" => \$opt_M,
+"md5=i" => \$opt_M,
+
+"w=s" => \$opt_w,
+"wstream=s" => \$opt_w,
+
+"tz=s" => \$opt_TimeZone,
+
+"clkpkt" => \$opt_ClockPkt,
+
+"fddi" => \$opt_fddi,
+
+"tcpdheader" => \$opt_tcpdheader,
+
+"linux" => \$opt_linux_pktheader, # Read extra data that shows up in RedHat 6.1 - 7.1
+"rh6" => \$opt_linux_pktheader, # Read extra data that shows up in RedHat 6.1
+
+"tcpdumpprog=s" => \$tcpdumpProg,
+
+"tcpdump=s" => \$opt_tcpdump,
+
+"regexp=s" => \$RegExp,
+
+"filtermodule=s" => \$FilterModule,
+"fmargs=s" => \$FilterModuleArguments,
+
+"countdup" => \$CountDupPkts,
+
+"dnsaudit" => \$opt_dnsaudit,
+
+"showbadchecksum" => \$ShowBadIPChecksumPacketNumbers,
+
+"mmap" => \$opt_mmap, # Not working yet
+           "man", "h", "help", "v",
+
+	  ) or pod2usage(2);
+
+pod2usage(1)  if ($opt_h);
+pod2usage(1)  if ($opt_help);
+pod2usage(-verbose => 2)  if ($opt_man);
+#pod2usage("$0: No arguments provided.")  if ((@ARGV == 0) && (-t STDIN));
+
+if ($opt_r) { # Single file specified
+  push(@InputFiles, $opt_r);
+} else {
+  @InputFiles = @ARGV;
+}
+
+# &getopts('ADSPElxivF:G:s:p:r:b:t:M:w:');
+
+# -l show printable packet data
+# -r input_tcpdump_file
+# -s start_packet
+# -p packets_to_process
+# -S attempt to decode SQL*net packet info
+# -A show absolute sequence and acknowledgement numbers
+# -x show data in hex
+# -v verbose, print data on all packets, otherwise just the summary is provided
+# -b seconds interval for bandwith usage plots
+# -t start time offset
+# -M nn Look for identical packets using MD5 for packets > nn size
+# -w directory   in which to write packet payloads, multiple files will be written
+
+# Can be used with piped input:
+#
+# tcpdump -i le0 -w - host www1 and port listener | /n/na1/uhome/meekj/lab/net/tcpd_read -v -r -
+#
+# a Cntrl-C will cause program to terminate and summary to be printed
+
+#
+# Load optional modules
+#
+
+$HaveNetDNS = 1; # Assume that we have it
+eval "use Net::DNS";
+do {
+  warn "Couldn't load Net::DNS, but that is OK: $@";
+  $HaveNetDNS = 0; # No, we don't have it
+} unless ($@ eq '');
+
+if ($opt_dnsaudit) {
+  $HaveStatistics = 1; # Assume that we have it
+  eval "use Statistics::Descriptive";
+  do {
+    warn "Couldn't load Statistics::Descriptive, but that is OK: $@";
+    $HaveStatistics = 0; # No, we don't have it
+  } unless ($@ eq '');
+  $DNSresponseStat = Statistics::Descriptive::Full->new() if $HaveStatistics;
+}
+
+if (defined $opt_M) {
+  $MD5threshold = $opt_M;
+  $ComputeMD5 = 1;
+     eval "use Digest::MD5";
+     do {
+       warn "Couldn't load Digest::MD5: $@";
+       $ComputeMD5 = 0;
+       undef $opt_M;
+     } unless ($@ eq '');
+    $md5 = Digest::MD5->new if ($ComputeMD5); # Initalize checksum code
+}
+
+# The eval allows this program to be run without the Convert::EBCDIC
+# module, since it will rarely be used, except for debugging IBM mainframe
+# or AS400 applications
+#
+if ($opt_E && $opt_l) { # Will convert EBCDIC data when -l is specified
+     eval "use Convert::EBCDIC(ebcdic2ascii)";
+     do {
+       warn "Couldn't load Convert::EBCDIC: $@";
+       undef $opt_E;
+     } unless ($@ eq '');
+}
+
+if ($opt_mmap) { # This never provided a performance benefit and should be removed
+     eval "use Mmap";
+     do {
+       warn "Couldn't load Mmap: $@";
+       undef $opt_mmap;
+     } unless ($@ eq '');
+}
+
+if ($FilterModule) { # Load the specified module to examine packets
+  $FilterModule =~ s/\.pm$//; # In case user included .pm
+  use File::Basename;
+  $basename = basename($FilterModule);
+  $dirname = dirname($FilterModule);
+  $FilterModule = 1; # Assume that we will be able to load the module
+
+#  print "$dirname - $basename\n";
+  push (@INC, $dirname);
+  print "Loading  $basename tcpdFilterModule\n" unless $Quiet;
+  eval "use $basename";
+  do {
+    die "Couldn't load $basename (tcpdFilterModule): $@";
+    $FilterModule = 0;
+  } unless ($@ eq '');
+  tcpdFilterModule->import();
+  &fmInit($FilterModuleArguments); # Initialize
+}
+
+# All numbers in HEX
+# http://www.iana.org/assignments/ethernet-numbers
+
+$ethertype_name{0x0060} = 'LOOP' ;
+$ethertype_name{0x0200} = 'ECHO' ;
+$ethertype_name{0x0400} = 'PUP' ;
+$ethertype_name{0x0500} = 'SPRITE' ;
+$ethertype_name{0x0600} = 'NS' ;
+$ethertype_name{0x0800} = 'IP' ;
+$ethertype_name{0x0801} = 'X75' ;
+$ethertype_name{0x0802} = 'NBS' ;
+$ethertype_name{0x0803} = 'ECMA' ;
+$ethertype_name{0x0804} = 'CHAOS' ;
+$ethertype_name{0x0805} = 'X25' ;
+$ethertype_name{0x0806} = 'ARP' ;
+$ethertype_name{0x1000} = 'TRAIL' ;
+$ethertype_name{0x6000} = 'DEC' ;
+$ethertype_name{0x6001} = 'DNA_DL' ; # MOPDL
+$ethertype_name{0x6002} = 'DNA_RC' ; # MOPRC
+$ethertype_name{0x6003} = 'DNA_RT' ; # Phase IV DECnet
+$ethertype_name{0x6004} = 'LAT' ;
+$ethertype_name{0x6005} = 'DIAG' ;
+$ethertype_name{0x6006} = 'CUST' ;
+$ethertype_name{0x6007} = 'SCA' ;
+$ethertype_name{0x8035} = 'RARP' ;
+$ethertype_name{0x8038} = 'LANBRG' ; # DEC LANBridge
+$ethertype_name{0x803C} = 'DECDNS' ;
+$ethertype_name{0x803E} = 'DECDTS' ;
+$ethertype_name{0x805B} = 'VEXP' ;
+$ethertype_name{0x805C} = 'VPROD' ;
+$ethertype_name{0x809B} = 'ATALK' ;
+$ethertype_name{0x80F3} = 'AARP' ;
+$ethertype_name{0x8137} = 'IPX' ;
+$ethertype_name{0x8138} = 'IPX' ;
+$ethertype_name{0x86DD} = 'IPv6' ;
+$ethertype_name{0x9000} = 'LBACK' ;  # MOP
+$ethertype_name{0x0A00} = 'PUP' ;    # Xerox IEEE802.3 PUP
+$ethertype_name{0x0A01} = 'PUP-AT' ; # Xerox IEEE802.3 PUP Address Translation
+$ethertype_name{0x8041} = 'DECLAST' ;
+
+# All numbers in HEX
+# http://www.iana.org/assignments/protocol-numbers
+
+$ip_type_name{'00'}='HOPOPT' ;
+$ip_type_name{'01'}='ICMP' ;
+$ip_type_name{'02'}='IGMP' ;
+$ip_type_name{'03'}='GGP ' ;
+$ip_type_name{'04'}='IPIP' ;
+$ip_type_name{'05'}='ST  ' ;
+$ip_type_name{'06'}='TCP ' ;
+$ip_type_name{'07'}='CBT ' ;
+$ip_type_name{'08'}='EGP ' ;
+$ip_type_name{'09'}='IGP ' ;
+$ip_type_name{'0C'}='PUP ' ; # 12
+$ip_type_name{'11'}='UDP ' ; # 17
+$ip_type_name{'16'}='IDP ' ; # 22 XNS IDP
+$ip_type_name{'1D'}='TP  ' ; # 29
+$ip_type_name{'29'}='IPv6' ; # 41
+$ip_type_name{'2A'}='SDRP ' ; # 42
+$ip_type_name{'2B'}='IPv6-Route' ; # 43 IPv6-Route
+$ip_type_name{'2C'}='IPv6-Frag' ; # 44 IPv6-Frag
+$ip_type_name{'2D'}='IDRP' ; # 45
+$ip_type_name{'2E'}='RSVP' ; # 46
+$ip_type_name{'2F'}='GRE ' ; # 47
+$ip_type_name{'30'}='MHRP' ; # 48 Mobile Host Routing Protocol
+$ip_type_name{'31'}='BNA ' ; # 49
+$ip_type_name{'32'}='ESP ' ; # 50
+$ip_type_name{'33'}='AH  ' ; # 51
+$ip_type_name{'34'}='I-NLSP' ; # 52
+$ip_type_name{'35'}='SWIPE ' ; # 53
+$ip_type_name{'36'}='NARP ' ;  # 54
+$ip_type_name{'37'}='MOBILE ' ;# 55
+$ip_type_name{'38'}='TLSP ' ;  # 56
+$ip_type_name{'39'}='SKIP' ;   # 57
+$ip_type_name{'3A'}='IPv6-ICMP' ; # 58
+$ip_type_name{'3B'}='IPv6-NoNxt' ; # 59
+$ip_type_name{'3C'}='IPv6-Opts' ; # 60
+$ip_type_name{'3D'}='CFTP' ; # 61
+
+$ip_type_name{'50'}='EON ' ; # 80
+$ip_type_name{'58'}='IGRP' ; # 88
+$ip_type_name{'59'}='OSPF' ; # 89
+$ip_type_name{'86'}='RSVP-E2E-IGNORE' ; # 134
+$ip_type_name{'FF'}='RAW ' ; # 255
+
+foreach $key (keys %ip_type_name) { # Map keys to lowercase for some platforms or Perl versions
+  $lc_key = lc $key;
+  $ip_type_name{$lc_key} = $ip_type_name{$key};
+}
+
+$sql_net_name[1] = 'connect';
+$sql_net_name[2] = 'accept';
+$sql_net_name[3] = 'acknowledge';
+$sql_net_name[4] = 'refuse';
+$sql_net_name[5] = 'redirect';
+$sql_net_name[6] = 'data';
+$sql_net_name[7] = 'null - empty data, no flags';
+$sql_net_name[8] = 'unknown';
+$sql_net_name[9] = 'abort';
+$sql_net_name[10] = 'unknown';
+$sql_net_name[11] = 're-send';
+$sql_net_name[12] = 'marker';
+$sql_net_name[13] = 'attention';
+$sql_net_name[14] = 'control information';
+$sql_net_name[15] = 'unknown';
+$sql_net_name[16] = 'unknown';
+$sql_net_name[17] = 'unknown';
+$sql_net_name[18] = 'unknown';
+$sql_net_name[19] = 'highest legal packet type';
+
+$IPXptype[0] = 'Unk';
+$IPXptype[1] = 'RIP';
+$IPXptype[2] = 'Ech';
+$IPXptype[3] = 'Err';
+$IPXptype[4] = 'PEP';
+$IPXptype[5] = 'SPP';
+$IPXptype[17] = 'NCP';
+
+$IPXsock{'0451'} = 'NCP';
+$IPXsock{'0452'} = 'SAP';
+$IPXsock{'0453'} = 'RIP';
+$IPXsock{'0455'} = 'NBI';
+$IPXsock{'0456'} = 'Dia';
+
+$ICMPtypename{'0-0'} = 'Echo reply';
+$ICMPtypename{'3-0'} = 'Network unreachable';
+$ICMPtypename{'3-1'} = 'Host unreachable';
+$ICMPtypename{'3-2'} = 'Protocol unreachable';
+$ICMPtypename{'3-3'} = 'Port unreachable';
+
+$ICMPtypename{'3-4'} = 'Frag needed but DF set';
+$ICMPtypename{'3-5'} = 'Source route failed';
+$ICMPtypename{'3-6'} = 'Destination net unknown';
+$ICMPtypename{'3-7'} = 'Destination host unknown';
+$ICMPtypename{'3-8'} = 'Source host isolated';
+$ICMPtypename{'3-9'} = 'Dest net admin prohibited';
+$ICMPtypename{'3-10'} = 'Dest host admin prohibited';
+$ICMPtypename{'3-11'} = 'Network unreachable for TOS';
+$ICMPtypename{'3-12'} = 'Host unreachable for TOS';
+$ICMPtypename{'3-13'} = 'Prohibited by filtering';
+$ICMPtypename{'3-14'} = 'Host precedence violation';
+$ICMPtypename{'3-15'} = 'Precedence cutoff in effect';
+$ICMPtypename{'4-0'} = 'Source quench';
+$ICMPtypename{'5-0'} = 'Redirect for network'; 
+$ICMPtypename{'5-1'} = 'Redirect for host'; 
+$ICMPtypename{'5-2'} = 'Redirect for TOS and net'; 
+$ICMPtypename{'5-3'} = 'Redirect for TOS and host'; 
+$ICMPtypename{'8-0'} = 'Ping request';
+$ICMPtypename{'9-0'} = 'Router advertisement';
+$ICMPtypename{'10-0'} = 'Router solicitation';
+$ICMPtypename{'11-0'} = 'Time exceded TTL=0 during transit';
+$ICMPtypename{'11-0'} = 'Time exceded TTL=0 during reassembly';
+$ICMPtypename{'12-0'} = 'IP header bad';
+$ICMPtypename{'12-1'} = 'Required option missing';
+$ICMPtypename{'13-0'} = 'Timestamp request';
+$ICMPtypename{'14-0'} = 'Timestamp reply';
+#$ICMPtypename{''} = '';
+#$ICMPtypename{''} = '';
+#$ICMPtypename{''} = '';
+
+#
+# DHCP Codes from RFC-1533
+#
+$DHCP_message_type[1] = 'DISCOVER';
+$DHCP_message_type[2] = 'OFFER';
+$DHCP_message_type[3] = 'REQUEST';
+$DHCP_message_type[4] = 'DECLINE';
+$DHCP_message_type[5] = 'ACK';
+$DHCP_message_type[6] = 'NAK';
+$DHCP_message_type[7] = 'RELEASE';
+
+$DHCP_code[1] = 'Subnet Mask';
+$DHCP_code[2] = 'Time Offset';
+$DHCP_code[3] = 'Router';
+$DHCP_code[6] = 'Domain Name Server';
+$DHCP_code[12] = 'Host Name';
+$DHCP_code[15] = 'Domain Name';
+$DHCP_code[43] = 'Vendor-specific';
+$DHCP_code[44] = 'NetBIOS over TCP/IP Name Server';
+$DHCP_code[46] = 'NetBIOS over TCP/IP Node Type';
+$DHCP_code[50] = 'Requested IP Address';
+$DHCP_code[51] = 'IP Address Lease Time';
+$DHCP_code[53] = 'DHPC Message Type';
+$DHCP_code[54] = 'Server Identifier';
+$DHCP_code[55] = 'Parameter Request List';
+$DHCP_code[58] = 'Renewal (T1) Time Value';
+$DHCP_code[59] = 'Rebinding (T2) Time Value';
+$DHCP_code[61] = 'Client-identifier';
+
+# Define some DHCP data types
+$DHCP_code_type[1] = 'Subnet Mask';
+$DHCP_code_type[2] = 'N';
+$DHCP_code_type[3] = 'Router';
+$DHCP_code_type[6] = 'Domain Name Server';
+$DHCP_code_type[12] = 'string';
+$DHCP_code_type[15] = 'string';
+$DHCP_code_type[43] = 'Vendor-specific';
+$DHCP_code_type[44] = 'NetBIOS over TCP/IP Name Server';
+$DHCP_code_type[46] = 'NetBIOS over TCP/IP Node Type';
+$DHCP_code_type[50] = 'Requested IP Address';
+$DHCP_code_type[51] = 'N';
+$DHCP_code_type[53] = 'DHPC Message Type';
+$DHCP_code_type[54] = 'Server Identifier';
+$DHCP_code_type[55] = 'Parameter Request List';
+$DHCP_code_type[58] = 'N';
+$DHCP_code_type[59] = 'N';
+$DHCP_code_type[61] = 'Client-identifier';
+
+$DNSpacketCount = 0;
+$DNSquestionCount = 0;
+$DNSanswerCount = 0;
+
+$FragmentCount = 0;
+
+
+if ($opt_TimeZone) {
+  $ENV{TZ} = $opt_TimeZone;
+}
+
+$SIG{INT} = \&catch_int; # Cntrl-C shutdown
+
+sub catch_int {
+    print "Interrupted by Cntrl-C...\n";
+}
+
+if ($opt_b) {
+    $BWinterval = $opt_b;
+}
+
+if ($opt_F) { # Read Frame Relay Information file
+  open(FRI, $opt_F) || warn "Can't open $opt_F for Frame Relay Information\n";
+  while ($in = <FRI>) {
+    $in =~ s/\s+\-\s+\n$//; # Remove trailing ' -LF'
+    ($FRtime, $FRfile, $FRethertype, $FRrest) = split(' ', $in, 4);
+    push(@FRTimes, $FRtime);
+    push(@FRInfo, $FRrest); # DLCI FECN BECN DE
+  }
+  close FRI;
+  $FRIindex = -1; # Global counter
+}
+
+if ($opt_G) { # Packet summary file
+  open(PKTSUM, ">$opt_G") || warn "Can't open $opt_G for packet summary\n";
+}
+
+if ($opt_pktdb) { # Packet database load file
+  open(PKTDB, ">$opt_pktdb") || warn "Can't open $opt_pktdb for packet database load\n";
+}
+
+if ($opt_bwfile) {
+  open(BWFILE, ">$opt_bwfile");
+}
+
+foreach $opt_r (@InputFiles) {	# Read data
+
+  if ($opt_tcpdump) {	    # Filter input with tcpdump before reading
+    $tcpdumpRead_gz = "gzip -dc $opt_r | $tcpdumpProg -r - -w - $opt_tcpdump |";
+    $tcpdumpRead_uc = "$tcpdumpProg -r $opt_r -w - $opt_tcpdump |";
+
+  } else {
+    $tcpdumpRead_gz = "gzip -dc $opt_r |";
+  }
+
+
+  $PktHeader{file_name} = $opt_r;
+  if ($opt_r =~ /\.gz$/) {
+    open(F, "$tcpdumpRead_gz")
+      || die "Couldn't open: $tcpdumpRead_gz   be sure gzip, and tcpdump if needed, are in your path\n";
+  } else {
+    if ($opt_tcpdump) {
+      #    print "cmd: $tcpdumpRead_uc\n";
+      open(F, "$tcpdumpRead_uc") || die "Couldn't open $tcpdumpRead_uc\n";
+    } else {
+      open(F, $opt_r) || die "Couldn't open $opt_r\n";
+      if ($opt_mmap) {
+	$mmap_success = mmap($MmapData, 0, PROT_READ, MAP_SHARED, F, 0);
+	$MmapPointer = 0;
+	if ($mmap_success) {
+	  print "Mmap opened file successfully\n";
+	} else {
+	  print "Mmap open failed\n";
+	  #	undef $opt_mmap;
+	}
+      }
+    }
+  }
+
+  binmode(F);			# For DOS and Perl 5.8.0 on RedHat 8.0
+
+  if ($opt_mmap) {		# nmap access is experimental
+    print "Mmap reading header\n";
+    #  $FileHeader = substr($MmapData, $MmapPointer, $FILE_HEAD_LENGTH);
+    ($FileHeader) = unpack("x$MmapPointer A$FILE_HEAD_LENGTH", $MmapData);
+    $tlen1 = length($MmapData);
+    $tlen2 = length($FileHeader);
+    print "$tlen1  $tlen2  x$MmapPointer A$FILE_HEAD_LENGTH\n";
+    &PrintHex($FileHeader);
+    $MmapPointer += $FILE_HEAD_LENGTH;
+  } else {
+    read(F, $FileHeader, $FILE_HEAD_LENGTH);
+  }
+
+  $VAXunpack = 0;
+  ($Magic, $VerMajor, $VerMinor, $ThisZone, $SigFigs, $SnapLen, $LinkType) =
+    unpack("N n n N N N N", $FileHeader);
+
+  if ($VerMajor > 100) {	# Must be other byte ordering
+    ($Magic, $VerMajor, $VerMinor, $ThisZone, $SigFigs, $SnapLen, $LinkType) =
+      unpack("V v v V V V V", $FileHeader);
+    $VAXunpack = 1;
+  }
+
+  if ($opt_tcpdheader) {
+    print "
+Magic      $Magic
+VerMajor   $VerMajor
+VerMinor   $VerMinor
+ThisZone   $ThisZone
+SigFigs    $SigFigs
+SnapLen    $SnapLen
+LinkType   $LinkType\n";
+
+    if ($VAXunpack == 1) {
+      print "VAXunpack  On\n";
+    } else {
+      print "VAXunpack  Off\n";
+    }
+  }
+
+  $PktHeader{magic} = $Magic;
+  $PktHeader{version_major} = $VerMajor;
+  $PktHeader{version_minor} = $VerMinor;
+  $PktHeader{thiszone} = $ThisZone;
+  $PktHeader{sigfigs} = $SigFigs;
+  $PktHeader{snaplen} = $SnapLen;
+  $PktHeader{linktype} = $LinkType;
+
+  print "Packet Analysis from tcpdump file: $opt_r $opt_s $opt_p\n\n" unless $Quiet;
+  print "tcpdump pre-filter: $opt_tcpdump\n" if ($opt_tcpdump and not $Quiet);
+
+  if ($opt_t) {
+    $TimeOffset = $opt_t;
+  } else {
+    $TimeOffset = 0.0;
+  }
+
+
+  if ($opt_v) {
+    print "Packet    Time,s       Sess      From             >        To                   Window  PLen  DLen   dTime       AckT   Sequence        Ack";
+
+    if ($opt_F) {
+      print " DLCI F B D";
+    }
+    print "\n";
+  }
+
+  $LastPacketTime = 0;
+  $DeltaTime = 0;
+  while (1) {
+    $FRIindex++ if $opt_F;
+
+    if ($opt_mmap) {
+      #      $PacketHeader = substr($MmapData, $MmapPointer, $PACKET_HEAD_LENGTH);
+      $MmapPointer += $PACKET_HEAD_LENGTH;
+    } else {
+      $brh = read(F, $PacketHeader, $PACKET_HEAD_LENGTH); # Read packet header
+    }
+
+    last if ($brh < $PACKET_HEAD_LENGTH);
+
+    if ($VAXunpack) {
+      ($Seconds, $uSeconds, $CaptureLength, $TotalLength) =
+	unpack("V V V V", $PacketHeader);
+    } else {
+      ($Seconds, $uSeconds, $CaptureLength, $TotalLength) =
+	unpack("N N N N", $PacketHeader);
+    }
+    $PacketSeconds = $Seconds;
+    $PacketMicroSeconds = $uSeconds;
+
+    $PktMeta{tv_sec} = $Seconds;
+    $PktMeta{tv_usec} = $uSeconds;
+    $PktMeta{caplen} = $CaptureLength;
+    $PktMeta{len} = $TotalLength;
+
+    if ($opt_linux_pktheader) {	# Read extra data that shows up in RedHat 6.1-7.1 tcpdump
+                                # Why did they do this to us?
+
+      if ($opt_mmap) {
+	#	$LinuxExtra = substr($MmapData, $MmapPointer, $LINUX_HEAD_LENGTH);
+	($LinuxExtra) = unpack("x$MmapPointer A$LINUX_HEAD_LENGTH",$MmapData); 
+	$MmapPointer += $LINUX_HEAD_LENGTH;
+      } else {
+	$brh = read(F, $LinuxExtra, $LINUX_HEAD_LENGTH); # Read packet header
+      }
+
+      if ($VAXunpack) {
+	($PktHeaderIfindex, $PktHeaderProtocol, $PktHeaderPkt_type) =
+	  unpack("V v C", $LinuxExtra);
+      } else {
+	($PktHeaderIfindex, $PktHeaderProtocol, $PktHeaderPkt_type) =
+	  unpack("N n C", $LinuxExtra);
+      }
+    }
+
+    $uSeconds = sprintf("%06d", $uSeconds); # Add leading zeros
+    $PktMeta{pkttime} = "$Seconds.$uSeconds" + $TimeOffset;
+    $FileStartTime = $PktMeta{pkttime} unless $FileStartTime;
+
+    if (($CaptureLength < 0) or ($CaptureLength > 10000)) {
+      print "Error - CaptureLength: $CaptureLength\n";
+      print "you may need the --rh6 flag, or the file may not be valid\n";
+      exit;
+    }
+
+    if ($opt_mmap) {
+      #      $PacketData = substr($MmapData, $MmapPointer, $CaptureLength);
+      ($PacketData) = unpack("x$MmapPointer A$CaptureLength",$MmapData); 
+      $MmapPointer += $CaptureLength;
+    } else {
+      $brd = read(F, $PacketData, $CaptureLength); # Read packet contents
+    }
+
+
+    if ($opt_starts) {
+      next unless (($PktMeta{pkttime} - $FileStartTime) >= $opt_starts);
+    }
+    if ($opt_ends) {
+      last unless (($PktMeta{pkttime} - $FileStartTime) <= $opt_ends);
+    }
+
+    if ($LastPacketTime > 0) {
+      $DeltaTime = $PktMeta{pkttime} - $LastPacketTime;
+      #	push(@PacketSepTimes, $DeltaTime);
+    }
+
+    $PacketCount++;
+    $PktMeta{pktnum} = $PacketCount;
+    $FirstPacketTime = $PktMeta{pkttime} unless $FirstPacketTime;
+
+    #    print "$PacketCount >= $opt_s\n";
+
+    if ($opt_s > 0) {		# Process limited packet range
+      if ($PacketCount >= $opt_s) {
+	$FirstPrintedPacketTime = $PktMeta{pkttime} unless $FirstPrintedPacketTime;
+	&PrintPacket($PacketData);
+	$TotalBytes += $TotalLength;
+	$ProcessedPackets++;
+      }
+    } else {			# Process all packets
+      $TotalBytes += $TotalLength;
+      $ProcessedPackets++;
+      if ($opt_b) {
+	$BWbinSecond = int $PktMeta{pkttime} unless $BWbinSecond; # First time through
+	if ($PktMeta{pkttime} > ($BWbinSecond + $BWinterval)) {	# Move to next bin
+	  $BWbinSecond = int $PktMeta{pkttime};
+	}
+	$BWbytes{$BWbinSecond} += $TotalLength;
+	$BWpackets{$BWbinSecond}++;
+      }
+
+      &PrintPacket($PacketData);
+    }
+
+    $LastPacketTime = $PktMeta{pkttime};
+
+    last if ($opt_p && ($PacketCount > $opt_p)); # Print limited range
+  }
+}
+
+$ElapsedTime = $LastPacketTime - $FirstPacketTime;
+
+$StartDate = &strftime('%R:%S %a %b %e %Y', localtime($FirstPacketTime));
+$EndDate =   &strftime('%R:%S %Z %a %b %e %Y', localtime($LastPacketTime));
+
+print "\nFirst Packet at: $FirstPacketTime\n" unless $Quiet;
+print "\nTime Covered: $StartDate - $EndDate\n\n" unless $Quiet;
+if ($opt_starts && $opt_ends) {
+  print "Analysis of packets between $opt_starts s and $opt_ends s from start of capture\n";
+} elsif ($opt_starts) {
+  print "Analysis of packets starting at $opt_starts s from start of capture\n";
+} elsif ($opt_ends) {
+  print "Analysis of packets up to $opt_end s from start of capture\n";
+}
+printf "Elapsed Time: %0.1f s\n", $ElapsedTime unless $Quiet;
+
+
+if ($TimeOffset != 0.0) {
+    print "\nTime Offset:         $TimeOffset seconds\n";
+    $time_zero_packet = $FirstPacketTime;
+    $StartDate = &strftime('%R:%S %a %b %e %Y', localtime($time_zero_packet));
+    print "Time Zero Packet at: $time_zero_packet\n";
+    print "                     $StartDate\n\n";
+}
+
+print "Total Bytes:  $TotalBytes\n" unless ($Quiet);
+#print "Total Packet Bytes:  $TotalPacketBytes\n";
+#print "Total Data Bytes:    $TotalDataBytes\n";
+
+if ($opt_dirsum) {
+  print "\n TCP Packet Directions:                          Session   Total       Full Size    Back-to-Back  Tot Bytes    ~kbps   %All\n";
+
+  foreach $k (sort {$TotalBytesByDirection{$b} <=> $TotalBytesByDirection{$a}} keys %PacketDirection) {
+    # Session number will not be correct in the case of multiple sessions with same IPs and ports
+    ($k1, $k2) = split(/\s+>\s+/, $k); # Get the session key
+    $SKey = &SessionKey($k1, $k2);
+
+    $avg_bw = '';
+    if (($SessionStartTime{$SKey} > 0) && ($SessionEndTime{$SKey} > 0)) {
+      $dt = $SessionEndTime{$SKey} - $SessionStartTime{$SKey};
+      if ($dt > 0) {
+	$abw = 8 * $TotalBytesByDirection{$k} / (1000 * $dt); # Approx avg bandwidth in kbps
+	$avg_bw = sprintf("%8.1f", $abw);
+      }
+    }
+
+    $full_pct = 100.0 * $FullSizePackets{$k} / $PacketDirection{$k};
+    $btb_pct  = 100.0 * $BackToBackPackets{$k} / $PacketDirection{$k};
+    $all_pct  = 100.0 * $TotalBytesByDirection{$k} / $TotalBytes;
+    printf (" %45s %8d %8d %8d %5.1f%% %8d %5.1f%%  %9d %8s %5.1f%%\n",
+	    $k, $SessionNumbers{$SKey}, $PacketDirection{$k}, $FullSizePackets{$k},
+	    $full_pct, $BackToBackPackets{$k}, $btb_pct,
+	    $TotalBytesByDirection{$k}, $avg_bw, $all_pct);
+  }
+}
+
+#
+# Count re-transmitted packets in each TCP session
+#
+$TotalReTrans = 0;
+foreach $k (keys %TCPseqNums) {
+    next unless ($TCPseqNums{$k} > 1);
+    ($sess, $seq) = split(/\-/, $k);
+    $num_retrans = $TCPseqNums{$k} - 1;
+    $ReTransBySession[$sess] += $num_retrans;
+    if ($num_retrans > $MaxPktReTransBySession[$sess]) {
+      $MaxPktReTransBySession[$sess] = $num_retrans;
+    }
+    $TotalReTrans += $num_retrans;
+}
+
+#
+# Count packets with same Sequence Number and IP ID (Hardware Duplicates)
+#
+if ($CountDupPkts) {
+  $TotalTCPduplicates = 0;
+  foreach $k (keys %TCPseqNumIDs) {
+    next unless ($TCPseqNumIDs{$k} > 1);
+    #print "*** $TCPseqNumIDs{$k}  $k\n";
+    $TotalTCPduplicates += $TCPseqNumIDs{$k} - 1;
+  }
+}
+
+
+$TCPsessionCount = $#SessionID;
+if ($TCPsessionCount < 0) {
+  $TCPsessionCount = 0;
+}
+
+if (!$Quiet && !$opt_nosessionsum && $TCPsessionCount) {
+
+  #
+  # Specifying --tcp_endt_sort will sort session list by last packet time
+  #
+  $session_sort_order = '';
+  if ($opt_tcp_endt_sort) {
+    # Sort by session end time, actually last time we saw a packet for each session
+    $session_sort_order = "$TCPsessionCount sessions sorted by time last packet was observed";
+    %session_numbers = %SessionNumbers;
+    foreach $k (sort {$SessionEndTime{$a} <=> $SessionEndTime{$b}} keys %SessionEndTime) {
+      push(@SessionListOrder, $k);
+      delete($session_numbers{$k});
+    }
+    foreach $k (sort {$SessionNumbers{$a} <=> $SessionNumbers{$b}} keys %session_numbers) {
+      # Pick up sessions missed (probably not used, we update $SessionEndTime on every packet
+      push(@SessionListOrder, $k);
+    }
+
+  } else {
+
+    # Sort by session start time, actually first time we saw a packet for each session
+    $session_sort_order = "$TCPsessionCount sessions sorted by time first packet was observed";
+    %session_numbers = %SessionNumbers;
+    foreach $k (sort {$SessionStartTime{$a} <=> $SessionStartTime{$b}} keys %SessionStartTime) {
+      push(@SessionListOrder, $k);
+      delete($session_numbers{$k});
+    }
+    foreach $k (sort {$SessionNumbers{$a} <=> $SessionNumbers{$b}} keys %session_numbers) {
+      # Pick up sessions missed (probably not used, we update $SessionEndTime on every packet
+      push(@SessionListOrder, $k);
+    }
+
+  }
+
+  print "\nTCP: $session_sort_order\n";
+
+  print "                                                            Re-Transmits\n";
+  print "Session                                             Packets    Total Pkt      Bytes    First       Last  Duration  Flags\n";
+  #print "Session                                             Packets  ReTrans Max      Bytes    First       Last  Duration\n";
+
+  foreach $k (@SessionListOrder) {
+    $i = $SessionNumbers{$k};
+    if ($SessionStartTime{$k} > 0) {
+      $s_start = &strftime('%R:%S', localtime($SessionStartTime{$k}));
+    } else {
+      $s_start = '';
+    }
+    if ($SessionEndTime{$k} > 0) {
+      $s_end = &strftime('%R:%S', localtime($SessionEndTime{$k}));
+    } else {
+      $s_end = '';
+    }
+    if (($SessionStartTime{$k} > 0) && ($SessionEndTime{$k} > 0)) {
+      $dt = $SessionEndTime{$k} - $SessionStartTime{$k};
+      $s_dt = sprintf("%9.3f", $dt);
+    } else {
+      $s_dt = '';
+    }
+
+    if ($SessionSynFin{$k} eq 'FIN') { # Clean-up formatting if no SYN
+      $SessionSynFin{$k} = '    FIN';
+    }
+    if (exists $SessionDirection{$k}) {
+      $session = $SessionDirection{$k};
+    } else {
+      $session = $k;
+    }
+    printf ("%4d %45s %8d %8d %3d %10d %8s - %8s %9s  %-8s\n",
+	    $i, $session, $SessionPackets{$k}, $ReTransBySession[$i],
+	    $MaxPktReTransBySession[$i], $SessionBytes{$k},
+	    $s_start, $s_end, $s_dt, $SessionSynFin{$k});
+  }
+
+  if ($UdpSessionNumber) {
+    print "\n\nUDP Sessions\n";
+    print "Session                                             Packets      Bytes   First    Last      Duration\n";
+
+    for ($j = 1; $j < @UdpSessionID; $j++) {
+
+      $k = $UdpSessionID[$j];
+
+      if ($UdpSessionStartTime{$k} > 0) {
+	$s_start = &strftime('%R:%S', localtime($UdpSessionStartTime{$k}));
+      } else {
+	$s_start = '';
+      }
+      if ($UdpSessionEndTime{$k} > 0) {
+	$s_end = &strftime('%R:%S', localtime($UdpSessionEndTime{$k}));
+      } else {
+	$s_end = '';
+      }
+      if (($UdpSessionStartTime{$k} > 0) && ($UdpSessionEndTime{$k} > 0)) {
+	$dt = $UdpSessionEndTime{$k} - $UdpSessionStartTime{$k};
+	$s_dt = sprintf("%9.3f", $dt);
+      } else {
+	$s_dt = '';
+      }
+
+    if (exists $UdpSessionDirection{$k}) {
+      $session = $UdpSessionDirection{$k}; # not yet implemented
+    } else {
+      $session = $k;
+    }
+
+#      print "$j  $k $session, $UdpSessionPackets{$k}, $UdpSessionBytes{$k}, $s_start, $s_end, $s_dt \n";
+
+      printf "%4d %45s %8d %10d %8s - %8s %9s\n",
+	      $j, $session, $UdpSessionPackets{$k}, $UdpSessionBytes{$k}, $s_start, $s_end, $s_dt;
+
+
+    }
+
+    print "\n";
+
+  }
+
+}
+
+if (!$Quiet) {
+
+  if ($TotalTCPduplicates) {
+    print " $TotalTCPduplicates Duplicate TCP Packets (Includes Overlap with Re-Transmissions)\n";
+  }
+
+  if (@BadIPChecksums) { # Had some bad IP checksums
+    $num = scalar @BadIPChecksums;
+    print "\n $num Packets with Bad IP Checksums:\n";
+    if ($ShowBadIPChecksumPacketNumbers) {
+      foreach $num (@BadIPChecksums) {
+	print " $num";
+      }
+    } else {
+      print "      to see packet numbers use --showbadchecksum\n";
+    }
+    print "\n";
+  }
+
+  print "\n Packets by Encapsulation:\n";
+  foreach $k (sort keys %PacketsByEncapsulation) {
+    print "  $k  - $PacketsByEncapsulation{$k}\n";
+  }
+
+  print "\n Packets by Protocol:\n";
+  print "                      Packets        Bytes  % of Total  AvgBW, kbps   Re-Transmits\n";
+
+  foreach $k (sort keys %PacketsByProto) {
+
+    $proto = $k;
+    $proto =~ s/\s+//g;
+
+    $percent = 100.0 * $BytesByProto{$k} / $TotalBytes;
+    if ($ElapsedTime != 0) {
+      $avg_kbps = 8 * $BytesByProto{$k} / (1000 * $ElapsedTime);
+    } else {
+      $avg_kbps = 0;
+    }
+    if ($proto eq 'IP-TCP') {	# Add re-transmit results
+      $rtpercent = 100 * $TotalReTrans / $PacketsByProto{$k};
+      printf " %15s %12d %12d   %6.2f  %8.1f  %12d  %6.2f %%\n",
+	$proto, $PacketsByProto{$k}, $BytesByProto{$k}, $percent, $avg_kbps, $TotalReTrans, $rtpercent;
+    } else {
+      printf " %15s %12d %12d   %6.2f  %8.1f\n",
+	$proto, $PacketsByProto{$k}, $BytesByProto{$k}, $percent, $avg_kbps;
+    }
+  }
+
+  if (%IPXnetPacketsSrc) {
+    print "\n\n                 Packets               Bytes\n";
+    print " IPX Network    Src     Dest        Src     Dest\n";
+    foreach $k (sort {$IPXnetPacketsSrc{$b} <=> $IPXnetPacketsSrc{$a}}
+		keys %IPXnetPacketsSrc) {
+      printf "%10s %8d %8d   %8d %8d\n",
+	$k, $IPXnetPacketsSrc{$k}, $IPXnetPacketsDst{$k},
+	  $IPXnetBytesSrc{$k}, $IPXnetBytesDst{$k};
+
+      delete $IPXnetPacketsDst{$k};
+      delete $IPXnetBytesSrc{$k};
+      delete $IPXnetBytesDst{$k};
+    }
+    foreach $k (sort keys %IPXnetPacketsDst) {
+      printf "%10s          %8d            %8d\n",
+	$k, $IPXnetPacketsDst{$k}, $IPXnetBytesDst{$k};
+    }
+
+  }
+
+  print "\n Fragment packets: $FragmentCount\n" if ($FragmentCount);
+
+  if ($opt_S) {
+    print "SQL*Net Packet Types:\n";
+    foreach $k (sort keys %SQLpacketCount) {
+      print " $k - $SQLpacketCount{$k}\n";
+    }
+  }
+
+  if ($ComputeMD5) {
+    print "\nPayload MD5 Check for Identical Packets\n\n";
+
+    print "Data Length Num\n";
+    print "Full  MD5 Occur   MD5 Checksum                     Packet Numbers with Likely Identical Content\n";
+
+    foreach $k (sort FirstMD5PacketNum keys %MD5count) {
+      if ($MD5count{$k} > 1) {
+	printf "%4d %4d %5d %s - %s\n",
+	  $MD5length{$k}, $MD5size{$k}, $MD5count{$k}, $k, $MD5packets{$k};
+      }
+    }
+  }
+
+  if ($PacketCountDHCP > 0) {
+    print "\nDHCP Summary: $PacketCountDHCP packets\n";
+
+    print "BOOTP/DHCP Servers Seen:\n";
+    foreach $k (keys %DHCPserver_names) {
+      print " $k - $DHCPserver_names{$k}\n";
+    }
+
+    $report_string = '';
+    foreach $k (sort keys %DHCPrequest) {
+      if ((! exists $DHCPreply{$k}) && (! exists $DHCPxid_reply{$DHCPxid_request_by_node{$k}})) {
+	$report_string .= sprintf("%10s %5d\n", $k, $DHCPrequest{$k});
+	$DHCPnoreplys += $DHCPrequest{$k};
+      } else {
+	$DHCPreplys++;
+      }
+    }
+    if (length($report_string) > 0) {
+      print "DHCP Requests without replys:\n";
+      print $report_string;
+      printf "Total      %5d No Replys   %5d Replys\n", $DHCPnoreplys, $DHCPreplys;
+    }
+  }
+
+  if ($opt_dnsaudit) {
+    print "\nDNS Questions without Answers:\n";
+    print "   Time         ID         Source IP  Question \n";
+    $count = 0;
+    foreach $k (sort {$DNSquerytime{$a} <=> $DNSquerytime{$b}} keys %DNSquerytime) {
+      next if ($DNSquestionAnswered{$k});
+      $count++;
+      $fmtTime = &strftime('%R:%S', localtime($DNSquerytime{$k}));
+      $fmtSeconds = sprintf('%0.3f', $DNSquerytime{$k});
+      ($junk, $fract_seconds) = split(/\./, $fmtSeconds);
+      printf "%s.%s %6d  %-15s  %s\n", $fmtTime, $fract_seconds, $k, $DNSqueryFromIP{$k}, $DNSquestion{$k};
+    }
+    print "Total: $count\n";
+
+    print "\nDNS Answers without Questions:\n";
+    print "   Time         ID         Source IP  Question \n";
+    $count = 0;
+    foreach $k (sort {$DNSanswerNoQueryTime{$a} <=> $DNSanswerNoQueryTime{$b}} keys %DNSanswerNoQueryTime) {
+      $count++;
+      $fmtTime = &strftime('%R:%S', localtime($DNSanswerNoQueryTime{$k}));
+      $fmtSeconds = sprintf('%0.3f', $DNSquerytime{$k});
+      ($junk, $fract_seconds) = split(/\./, $fmtSeconds);
+      printf "%s.%s %6d  %-15s  %s\n", $fmtTime, $fract_seconds, $k, $DNSqueryFromIP{$k}, $DNSanswerNoQueryQuestion{$k};
+    }
+    print "Total: $count\n\n";
+    if ($HaveStatistics) {
+      printf "Response time range: %0.4f - %0.4f s\n", $DNSresponseStat->min(), $DNSresponseStat->max();
+      printf "               mean: %0.4f s +/- %0.4f\n", $DNSresponseStat->mean(), $DNSresponseStat->standard_deviation();
+    }
+
+    print "Total DNS packets:   $DNSpacketCount\n";
+    print "      DNS Questions: $DNSquestionCount\n";
+    print "      DNS Answers:   $DNSanswerCount\n";
+  }
+
+  if ($RegExpMatchCount) {
+    print "$RegExpMatchCount matches for $RegExp\n";
+    foreach $k (sort {$a <=> $b} keys %RegExpMatchSession) {
+      printf "%6d %6d  %s\n", $k, $RegExpMatchSession{$k}, $RegExpMatchSessionKey{$k};
+    }
+    print "RegExp Match Ports: ";
+    foreach $p (sort {$a <=> $b} keys %RegExpMatchPorts) {
+      print "$p ";
+    }
+    print "\n";
+  }
+}
+
+if ($FilterModule) {
+  &fmListResults(\%PktHeader);
+}
+
+if ($opt_G) {			# Packet summary file
+  close PKTSUM;
+}
+
+if ($opt_pktdb) {		# Packet database load file
+  close PKTDB;
+}
+
+if ($opt_P) {			# Print data for plots
+
+  $PltFile = "t.plt";
+
+  unlink $PltFile if -e $PltFile;
+
+  open(PLT, ">$PltFile") || warn "Can't open $PltFile\n";
+
+  print PLT "$StartDate  $opt_r\n";
+
+  foreach $k (sort keys %PlotData) {
+    print PLT "\n$k\n";
+    print PLT $PlotData{$k};
+  }
+
+  print PLT "&\n";
+  for ($i = 0; $i <= $#SessionBW; $i++) {
+    $kbps = 8 * $SessionBW[$i] / 1000;
+    print PLT "$i  $kbps\n";
+  }
+
+}
+
+if ($opt_b) { # Generate bandwidth report
+
+  if ($opt_bwfile) { # Write to xmgrace data file
+    print BWFILE "type xy\n";
+  }
+
+  foreach $k (sort {$a <=> $b} keys %BWbytes) {
+    $kbps = 8 * $BWbytes{$k} / ($BWinterval * 1000);
+    $rel_time = $k - int($FirstPacketTime);
+
+    if ($opt_bwfile) {
+      printf BWFILE "%10d %9.2f\n", $rel_time, $kbps;
+    }
+    $aBWpackets[$rel_time] = $BWpackets{$k}; # Use array so that "zero periods" are reported
+    $aBWbytes[$rel_time] = $BWbytes{$k};
+    $aBWkbps[$rel_time] = $kbps;
+    $aBWretransmits[$rel_time] = $BWretransmits{$k};
+    $aBWsyns[$rel_time] = $BWsyns{$k};
+    $aBWfin_rsts[$rel_time] = $BWfin_rsts{$k};
+  }
+
+   if ($IsoTimeBW) {
+     print "\n Time                 Packets   Bytes      kbps  TCP ReTransmits  %     SYNs  FIN/RST\n";
+   } else {
+     print "\n Second  Packets   Bytes      kbps  TCP ReTransmits  %     SYNs  FIN/RST Time\n";
+   }
+
+  for ($i=0; $i<@aBWpackets; $i++) {
+    next if ($NoZeroPacketsBW && ($aBWpackets[$i] == 0));
+    if ($aBWretransmits[$i] > 0) {
+      $retrans_percent = 100.0 * $aBWretransmits[$i] / $aBWpackets[$i];
+    } else {
+      $retrans_percent = 0.0;
+    }
+
+    $fmtBWtime = &strftime('%R:%S', localtime($FirstPacketTime + $i));
+    if ($IsoTimeBW) {
+      $iso_time = &ISO8601($FirstPacketTime + $i); # For plotting, etc
+      printf "%s %6d %10d %9.2f %7d       %6.2f  %6d %6d\n",
+	$iso_time, $aBWpackets[$i], $aBWbytes[$i], $aBWkbps[$i], $aBWretransmits[$i], $retrans_percent,
+	$aBWsyns[$i], $aBWfin_rsts[$i];
+    } else {
+      printf "%6d %6d %10d %9.2f %7d       %6.2f  %6d %6d   %s\n",
+	$i, $aBWpackets[$i], $aBWbytes[$i], $aBWkbps[$i], $aBWretransmits[$i], $retrans_percent,
+	$aBWsyns[$i], $aBWfin_rsts[$i], $fmtBWtime;
+    }
+  }
+
+  close BWFILE if $opt_bwfile;
+}
+
+print "\n$RCSid\n" unless ($Quiet);
+
+#-----------------------------------------------------------------------
+
+sub SQLnetDecode {
+    my ($Data) = @_;
+
+# This routine provides a partial look into SQL*Net packets
+# it currently handles only SQL*Net packets that start at the
+# beginning of a TCP packet, this probably affects data packets
+#
+# Reference - Oracle Corporate Support Problem Repository:
+# Prob# 1007807.6  SQL*NET PACKET STRUCTURE: NS PACKET HEADER
+# Soln# 2055811.6  SQL*NET PACKET STRUCTURE: NS PACKET HEADER
+
+    if ($SQLdata_count{$From} > 0) {
+	print "      Continuing SQL*Net data ($SQLdata_count{$From} to go)\n";
+	$SQLdata_count{$From} -= $DataLength;
+	return;
+    }
+
+    ($NSPHDLEN, $NSPHDPSM, $NSPHDTYP, $dummy, $NSPHDHSM) =
+	unpack('n n  C C n', $Data);
+
+    return unless (length($sql_net_name[$NSPHDTYP]) > 1);
+    print "      SQL*Net  NSPHDLEN: $NSPHDLEN  Type: $sql_net_name[$NSPHDTYP] ($NSPHDTYP)";
+
+    if ($NSPHDTYP == 1) { # Connect
+	$SQLpacketCount{Connect}++;
+	($NSPHDLEN, $NSPHDPSM,
+	 $NSPHDTYP, $dummy, $NSPHDHSM,
+	 $NSPCNVSN, $NSPCNLOV,
+	 $NSPCNOPT, $NSPCNSDU,
+	 $NSPCNTDU, $NSPCNNTC,
+	 $NSPCNTNA, $NSPCNONE,
+	 $NSPCNLEN, $NSPCNOFF,
+	 $NSPCNMXC,
+	 $NSPCNFL0,
+	 $NSPCNFL1, $dum2, $dum3, $SQLdata) =
+	    unpack('n n  C C n  n n n n n n n n n n N C C n n a*', $Data);
+
+	print "
+       Connect: Packet version: $NSPCNVSN Lowest compatible version: $NSPCNLOV
+       Global service options supported: $NSPCNOPT
+       SDU: $NSPCNSDU  Maximum TDU: $NSPCNTDU   Line turnaround: $NSPCNTNA
+       NT protocol charac: $NSPCNNTC
+       Length of connect data: $NSPCNLEN
+       Offset to start of connect data: $NSPCNOFF\n";
+    }
+
+    if ($NSPHDTYP == 2) { # Accept
+	$SQLpacketCount{Accept}++;	
+	($NSPHDLEN, $NSPHDPSM,
+	 $NSPTAC, $dum1, $NSPHDHSM,
+	 $NSPACVSN, $NSPACOPT,
+	 $NSPACSDU, $NSPACTDU,
+	 $NSPACONE, $NSPACLEN,
+	 $NSPACOFF, $NSPACFL0, $NSPACFL1,
+	 $dum2,
+	 $SQLdata) =
+	    unpack('n n  C C n  n n n n n n  n C C N a*', $Data);
+
+	print "       Accept: NSPTAC: $NSPTAC  NSPHDHSM: $NSPHDHSM
+       Version for this connection $NSPACVSN  Global service options: $NSPACOPT
+       SDU: $NSPACSDU  Maximum TDU: $NSPACTDU
+       1 = $NSPACONE  Length of connect data: $NSPACLEN
+       Offset to start of connect data: $NSPACOFF Flags1: $NSPACFL0 Flags2: $NSPACFL1\n";
+
+    }
+
+
+    if ($NSPHDTYP == 3) { # Acknowledge
+	$SQLpacketCount{Acknowledge}++;	
+	print "      Acknowledge\n";
+    }
+
+    if ($NSPHDTYP == 4) { # 
+	$SQLpacketCount{Refuse}++;	
+	print "      Refuse \n";
+    }
+
+    if ($NSPHDTYP == 5) { # 
+	$SQLpacketCount{Redirect}++;	
+	print "       Redirect\n";
+    }
+
+    if ($NSPHDTYP == 6) { # Data
+	$SQLpacketCount{Data}++;	
+
+	($NSPHDLEN, $NSPHDPSM,
+	 $NSPHDTYP, $dummy, $NSPHDHSM,
+	 $NSPDAFLG, $SQLdata) = unpack('n n  C C n  n  a*', $Data);
+
+#	print "      SQL*net Data: $NSPHDLEN, $NSPHDTYP, $NSPHDHSM, $NSPDAFLG\n";
+	$SQLdata_count{$From} = $NSPHDLEN - $DataLength;
+	print "      Flags: $NSPDAFLG  " unless ($NSPDAFLG == 0);
+
+# Flags need verification
+	$FTKN = &SetBitVar($NSPDAFLG, 0x1);
+	$FRCF = &SetBitVar($NSPDAFLG, 0x2);
+	$FCFM = &SetBitVar($NSPDAFLG, 0x4);
+	$FRSV = &SetBitVar($NSPDAFLG, 0x10);
+	$FMOR = &SetBitVar($NSPDAFLG, 0x20);
+	$FEOF = &SetBitVar($NSPDAFLG, 0x40);
+	$FIMM = &SetBitVar($NSPDAFLG, 0x100);
+	$FRTS = &SetBitVar($NSPDAFLG, 0x200);
+	$FRNT = &SetBitVar($NSPDAFLG, 0x400);
+
+	print " -hdx send token- " if $FTKN;
+	print " -request confirmation- " if $FRCF;
+	print " -confirmation- " if $FCFM;
+	print " -RESERVED (for hdx flag)- " if $FRSV;
+	print " -more data to come- " if $FMOR;
+	print " -end of file- " if $FEOF;
+	print " -do immediate confirmation- " if $FIMM;
+	print " -request-to-send- " if $FRTS;
+	print " -request NT trailer- " if $FRNT;
+	print "\n";
+
+    }
+
+    if ($NSPHDTYP == 7) { # 
+	$SQLpacketCount{null}++;	
+	print "      null - empty data, no flags\n";
+    }
+
+    if ($NSPHDTYP == 9) { # 
+	$SQLpacketCount{Abort}++;	
+	print "      Abort \n";
+    }
+
+    if ($NSPHDTYP == 11) { # 
+	$SQLpacketCount{Resend}++;	
+	print "      Re-send\n";
+    }
+
+    if ($NSPHDTYP == 12) { # 
+	$SQLpacketCount{Marker}++;	
+	print "      Marker\n";
+    }
+
+    if ($NSPHDTYP == 13) { # 
+	$SQLpacketCount{Attention}++;	
+	print "      Attention\n";
+    }
+
+    if ($NSPHDTYP == 14) { # 
+	$SQLpacketCount{'Control Information'}++;	
+	print "      Control Information\n";
+    }
+
+}
+
+sub PrintPacket {
+    my ($pkt) = @_ ;
+    my ($ether_dst , $ether_src , $ether_type ,
+    $ver, $tos, $totlen, $id, $flrag, $ttl, $proto,
+    $cksum, $src, $dst, $rest, $ether_type_or_length, $LengthIf802, $stuff802, $EtherType);
+
+    my ($WindowSize, $IPid, $seq, $ack, $TCPoptions, $From, $SrcPort, $To, $DstPort, $EncapsulationFlag);
+    my (%PktLink, %PktIP, %PktTCP, %PktUDP, %PktICMP);
+
+    my $PacketNotPrinted = 1;
+    my $RegExpMatchThisPacket = 0;
+    my $OutLine = '';
+
+    $SessionTime = $PktMeta{pkttime} - $FirstPacketTime;
+
+    if ($opt_v) { # Generate a formatted string
+      if ($opt_ClockPkt) {
+	$ms = 1000.0 * ($PktMeta{pkttime} - int($PktMeta{pkttime}));
+	$fmtPacketTime = &strftime(' %R:%S', localtime($PktMeta{pkttime}));
+	$fmtPacketTime .= sprintf('.%03d', $ms);
+      } else {
+	$fmtPacketTime = sprintf("%13.3f", $SessionTime);
+      }
+    }
+
+    if ($opt_fddi) { # FDDI encapsulation - in test mode - works, but header decode is bogus
+      ($starting_delimiter, $frame_control, $fddi_dst, $fddi_src, $junk, $rest)
+	= unpack ( 'n n H16 H16 c a*' , $pkt);
+#	= unpack ( 'n n H12 H20 c a*' , $pkt);
+      $LengthIf802 = $ether_type_or_length;
+      $LengthIf802 = 0x0800;
+      $ether_type_or_length = 0x0800; # Force IP
+    } else {
+      ($PktLink{ether_dest}, $PktLink{ether_src}, $ether_type_or_length, $rest)
+	= unpack ( 'H12 H12 n a*' , $pkt) ;
+      $LengthIf802 = $ether_type_or_length;
+    }
+    $PktLink{ether_type_or_length} = $ether_type_or_length;
+    $PktLink{data} = $rest;
+
+#    print "$ether_type_or_length  $LengthIf802\n";
+
+    if ($LengthIf802 < 1536) { # Packet is 802.3 RFC-1042 Ethernet, probably Novell
+	$Total802Bytes += $LengthIf802 + 14;
+
+	$PacketsByEncapsulation{'Ethernet 802.3'}++;
+	$EncapsulationFlag = '8';
+
+#	print "802.3 $LengthIf802 $PktLink{ether_dest}, $PktLink{ether_src}, $LengthIf802, $PktLink{ether_type}\n";
+
+	$PktLink{ether_type} = 0xFFFF; # Flag 802.3
+	$proto = 'FE';        # Claim it is all IPX
+
+	($checksum, $ipx_length, $transport, $ipx_type,
+	 $ipx_dst_net, $ipx_dst_node, $ipx_dst_socket,
+	 $ipx_src_net, $ipx_src_node, $ipx_src_socket) =
+	     unpack('H4 n C C H8 H12 H4  H8 H12 H4  a*', $rest);
+
+	$IPXnetPacketsSrc{$ipx_src_net}++;
+	$IPXnetPacketsDst{$ipx_dst_net}++;
+
+	$IPXnetBytesSrc{$ipx_src_net} += $ipx_length;
+	$IPXnetBytesDst{$ipx_dst_net} += $ipx_length;
+
+	undef $ptype;
+
+	$From = "$ipx_src_net.$ipx_src_node";
+
+	if (defined $IPXsock{$ipx_src_socket}) {
+	    $SrcPort = $IPXsock{$ipx_src_socket};
+	    $ptype = $SrcPort;
+	} else {
+	    $SrcPort = $ipx_src_socket;
+	}
+
+	$To = "$ipx_dst_net.$ipx_dst_node";
+	if (defined $IPXsock{$ipx_dst_socket}) {
+	    $DstPort = $IPXsock{$ipx_dst_socket};
+	    $ptype = $DstPort;
+	} else {
+	    $DstPort = $ipx_dst_socket;
+	}
+
+	$ptype = $IPXptype[$ipx_type] unless $ptype;
+
+	if ($opt_v) {
+	    $PacketNotPrinted = 0;
+	    printf "%6d %s %s  IPX %s",
+	    $PacketCount, $fmtPacketTime, $EncapsulationFlag, $ptype;
+	    printf " %16s %4s > %16s %4s", $From, $SrcPort, $To, $DstPort;
+#	    printf "       %5d %5d %7.3f", $TotalLength, $ipx_length, $DeltaTime;
+	    printf " %5d %7.3f", $TotalLength, $DeltaTime;
+	    if ($opt_F) {
+	      print "                                   $FRInfo[$FRIindex]";
+	    }
+	    print "\n";
+
+	}
+
+	$PacketsByProto{"IPX-$ptype"}++;
+	$BytesByProto{"IPX-$ptype"} += $TotalLength;
+	$BytesByProtoPlen{"IPX-$ptype"} += $ipx_length;
+
+	if ($FilterModule) { # Send packet and metadata to the "Filter Module"
+	  $RegExpMatchThisPacket = &fmNIPpacket(\%PktHeader, \%PktMeta, \%PktLink);
+	}
+
+	if ($opt_G) {
+	  print PKTSUM "IPX $PacketCount $PktMeta{pkttime} $TotalLength\n";
+	}
+	if ($opt_pktdb) {
+	  print PKTDB "IPX|$PktMeta{pkttime}|$TotalLength\n";
+	}
+	return;
+    }
+
+# RFC-894 Ethernet (the usual type)
+    $PktLink{ether_type} = $ether_type_or_length;
+    $PacketsByEncapsulation{'Ethernet'}++;
+    $EncapsulationFlag = 'E';
+
+    $EthernetPackets++;
+
+    if ($PktLink{ether_type} == 0x8100) { # Handle 802.1Q VLAN Headers
+      ($pri_cfi_id, $ether_type_or_length, $rest)
+	= unpack ( 'n n a*', $rest) ;
+      $LengthIf802 = $ether_type_or_length;
+      $PktLink{ether_type} = $ether_type_or_length;
+      $EncapsulationFlag = 'V';
+    }
+
+    if ($PktLink{ether_type} != 0x0800) { # Handle non-IP packets
+
+	if ($ethertype_name{$ether_type_or_length}) { # We know the name of these protocols
+	    $ProtoName = $ethertype_name{$ether_type_or_length};
+	    $PacketsByProto{$ProtoName}++;
+	    $BytesByProto{$ProtoName} += $TotalLength;
+	    $BytesByProtoPlen{$ProtoName} += length($pkt);
+
+	} else {                                      # We do not know these
+
+	    $fmt_proto = ($ethertype_name{$PktLink{ether_type}} ? $ethertype_name{$PktLink{ether_type}} : $PktLink{ether_type} );
+	    $fmt_proto .= '-' . ($ip_type_name{$proto} ? $ip_type_name{$proto} : $proto );
+
+	    $PacketsByProto{$fmt_proto}++;
+	    $BytesByProto{$fmt_proto} += $TotalLength;
+	    $BytesByProtoPlen{$fmt_proto} += $TotalLength; # or $TotalLength
+	    $ProtoName = $fmt_proto;
+	}
+
+	if ($opt_G) {
+	  print PKTSUM "$ProtoName $PacketCount $PktMeta{pkttime}  $TotalLength\n";
+	}
+	if ($opt_pktdb) {
+	  print PKTDB "$ProtoName|$PktMeta{pkttime}|$TotalLength\n";
+	}
+
+	if ($FilterModule) { # Send packet and metadata to the "Filter Module"
+	  $RegExpMatchThisPacket = &fmNIPpacket(\%PktHeader, \%PktMeta, \%PktLink);
+	}
+
+	return;
+    }
+#
+# Decode IP Packets (Only ICMP, UDP, and TCP Supported, others are counted)
+#
+    if ($PktLink{ether_type} == 0x0800) { # IP
+
+#      $IPheaderNoCksum = pack("C10 C2 C8", substr($rest, 0, 10), 0, substr($rest, 12, 8));
+#      $RawIPchecksum = &checksum($IPheaderNoCksum);
+      #
+      # Check IP header checksum
+      $ReceivedIPchecksum = &checksum(substr($rest, 0, 20)); # Should be zero
+
+	($verlen, $PktIP{tos}, $PktIP{len},
+	 $PktIP{id}, $flrag,
+	 $PktIP{ttl}, $PktIP{proto}, $PktIP{cksum},
+	 $src, $dst, $rest)
+	    = unpack ( 'C C n  n n  C H2 n  N N a*' , $rest) ;
+
+#      if ($ReceivedIPchecksum != 0) {
+#	printf "IP checksum %4x  %4x  %4x\n", $ReceivedIPchecksum, $RawIPchecksum, $PktIP{cksum};
+#      }
+
+      if ($ReceivedIPchecksum) { # Save bad IP checksum info only for TCP UDP ICMP
+	if (($PktIP{proto} eq '01') || ($PktIP{proto} eq '06') || ($PktIP{proto} eq '11')) {
+	  push(@BadIPChecksums, $PktMeta{pktnum});
+	}
+      }
+
+	$PktIP{src_ip} = &dotquad($src);
+	$PktIP{dst_ip} = &dotquad($dst);
+
+	$PktIP{ver} = $verlen >> 4;
+	$PktIP{hlen} = 4 * ($verlen & 017);
+
+        $PktIP{DF} = $flrag >> 14;        # Don't fragment
+#        $PktIP{MF} = $flrag & 0x4000; # Don't fragment
+#        $PktIP{MF} = (($flrag >> 13) & 01); # More fragments, not tested yet, need fragment capture
+        $PktIP{MF} = $flrag & 0x2000; # More fragments, may not work on data from Windows (?)
+
+        if ($MoreFragments{$PktIP{id}}) { # Continuing a fragmented packet
+	  $PktIP{proto} = 'FG';           # Dummy protocol to prevent further decoding
+	  $FragmentCount++;
+        }
+
+        $MoreFragments{$PktIP{id}}++ if $PktIP{MF};
+
+	$IPids{$PktIP{id}}++;
+
+	$fmt_proto = ($ethertype_name{$PktLink{ether_type}} ? $ethertype_name{$PktLink{ether_type}} : $PktLink{ether_type} );
+	$fmt_proto .= '-' . ($ip_type_name{$PktIP{proto}} ? $ip_type_name{$PktIP{proto}} : $PktIP{proto} );
+
+	$PacketsByProto{$fmt_proto}++;
+	$BytesByProto{$fmt_proto} += $TotalLength;
+	$BytesByProtoPlen{$fmt_proto} += $TotalLength; # or $TotalLength
+#
+# ICMP Packet Decoding
+#
+	if ($PktIP{proto} eq '01') { # ICMP
+	    ($PktICMP{type}, $PktICMP{code}, $PktICMP{cksum}, $PktICMP{data}) = unpack('C C n a*', $rest);
+#	    $SessionTime = $PktMeta{pkttime} - $FirstPacketTime - $TimeOffset;
+
+	    if ($FilterModule) { # Send packet and metadata to the "Filter Module"
+	      $RegExpMatchThisPacket = &fmICMPpacket(\%PktHeader, \%PktMeta, \%PktLink, \%PktIP, \%PktICMP);
+	    }
+
+	    if ($opt_v) {
+		$ICMPtypecode = "$PktICMP{type}-$PktICMP{code}";
+
+		$OutLine .= sprintf "%6d %s %s ICMP", $PacketCount, $fmtPacketTime, $EncapsulationFlag;
+		$OutLine .= sprintf " %16s %5s > %16s", $PktIP{src_ip}, $ICMPtypecode, $PktIP{dst_ip};
+		$OutLine .= sprintf "             %5d       %7.3f", $TotalLength, $DeltaTime;
+		if ($opt_F) {
+		  $OutLine .= "                                   $FRInfo[$FRIindex]";
+		}
+		if ($PktIP{tos}) {
+		    $OutLine .= sprintf "  TOS: %02x", $PktIP{tos};
+		}
+		$ICMPstring = '';
+		if (defined $ICMPtypename{$ICMPtypecode}) {
+		  $ICMPstring = " $ICMPtypename{$ICMPtypecode}";
+		}
+
+		if ($PktICMP{type} == 3) {
+
+		  if ($PktICMP{code} == 4) { # Fragmentation required, but DF set
+		  ($zero, $NextHopMTU, $verlen, $PktIP{tos}, $PktIP{len},
+		   $PktIP{id}, $flrag,
+		   $PktIP{ttl}, $PktIP{proto}, $PktICMP{cksum},
+		   $src, $dst, $SrcPort, $DstPort, $rest)
+		    = unpack ( 'n n C C n  n n  C H2 n  N N n n a*' , $PktICMP{data});
+		  $ICMPstring .= " Next hop MTU: $NextHopMTU";
+
+		} else {
+
+		  ($zero, $verlen, $PktIP{tos}, $PktIP{len},
+		   $PktIP{id}, $flrag,
+		   $PktIP{ttl}, $PktIP{proto}, $PktICMP{cksum},
+		   $src, $dst, $SrcPort, $DstPort, $rest)
+		    = unpack ( 'N C C n  n n  C H2 n  N N n n a*' , $PktICMP{data});
+		}
+
+
+		  $PktIP{src_ip} = &dotquad($src);
+		  $PktIP{dst_ip} = &dotquad($dst);
+		  if (exists $ip_type_name{$PktIP{proto}}) {
+		    $proto_name = $ip_type_name{$PktIP{proto}};
+		  } else {
+		    $proto_name = "($PktIP{proto})";
+		  }
+		  $ICMPstring .= " $proto_name $PktIP{src_ip}_$SrcPort > $PktIP{dst_ip}_$DstPort";
+
+		}
+		$OutLine .= $ICMPstring;
+		$OutLine .= "\n";
+		print $OutLine;
+		$PacketNotPrinted = 0;
+	    }
+
+	    if ($opt_G) {
+	      print PKTSUM "ICMP $PacketCount $PktMeta{pkttime} $TotalLength $PktIP{src_ip}_$SrcPort  $PktIP{dst_ip}_$DstPort\n";
+	    }
+	    if ($opt_pktdb) {
+	      print PKTDB "ICMP|$PktMeta{pkttime}|$TotalLength|$PktIP{src_ip}_$SrcPort|$PktIP{dst_ip}_$DstPort\n";
+	    }
+
+	    return;
+	}
+#
+# UDP Packet Decoding
+#
+	if ($PktIP{proto} eq '11') { # UDP
+	    ($PktUDP{src_port}, $PktUDP{dst_port},
+	     $PktUDP{len}, $PktUDP{cksum}, $PktUDP{data}) = unpack('n n n n a*', $rest);
+#	    $SessionTime = $PktMeta{pkttime} - $FirstPacketTime - $TimeOffset;
+	    $PktUDP{datalen} = $PktUDP{len} - 8; # Subtract off UDP header length
+
+	    $SKey = &SessionKey("$PktIP{src_ip}_$PktUDP{src_port}", "$PktIP{dst_ip}_$PktUDP{dst_port}"); # Generate normalized session key
+	    $PktMeta{sessionkey} = $SKey;
+
+	    if (!exists $UdpSessionPackets{$SKey}) {
+		$UdpSessionNumber++;
+		$UdpSessionID[$UdpSessionNumber] = $SKey;
+		$UdpSessionNumbers{$SKey} = $UdpSessionNumber;
+		$UdpSessionStartTime{$SKey} = $PktMeta{pkttime};
+##		$PktUDP{session_num} = $UdpSessionNumber;
+	    }
+	    $UdpSessionPackets{$SKey}++;
+	    $UdpSessionBytes{$SKey} += $TotalLength;
+	    $UdpSessionEndTime{$SKey} = $PktMeta{pkttime};
+
+	    if ($FilterModule) { # Send packet and metadata to the "Filter Module"
+	      $RegExpMatchThisPacket = &fmUDPpacket(\%PktHeader, \%PktMeta, \%PktLink, \%PktIP, \%PktUDP);
+	    }
+
+	    if ($opt_v) {
+		$OutLine .= sprintf "%6d %s %s  UDP", $PacketCount, $fmtPacketTime, $EncapsulationFlag;
+		$OutLine .= sprintf " %16s %5s > %16s %5s",
+		  $PktIP{src_ip}, $PktUDP{src_port}, $PktIP{dst_ip}, $PktUDP{dst_port};
+		$OutLine .= sprintf "       %5d %5d %7.3f",
+		$TotalLength, $PktUDP{datalen}, $DeltaTime;
+		if ($opt_F) {
+		  $OutLine .= "                                   $FRInfo[$FRIindex]";
+		}
+		if ($PktIP{tos}) {
+		    $OutLine .= sprintf "  TOS: %02x", $PktIP{tos};
+		}
+		if ($ReceivedIPchecksum != 0) {
+		  $OutLine .= " Bad IP Checksum";
+		}
+		$OutLine .= "\n";
+	    }
+
+	    if ($opt_G) {
+	      print PKTSUM "UDP $PacketCount $PktMeta{pkttime} $TotalLength $PktIP{src_ip}_$PktUDP{src_port}  $PktIP{dst_ip}_$PktUDP{dst_port}\n";
+	    }
+
+	    if ($opt_pktdb) {
+	      print PKTDB "UDP|$PktMeta{pkttime}|$TotalLength|$PktIP{src_ip}_$PktUDP{src_port}|$PktIP{dst_ip}_$PktUDP{dst_port}\n";
+	    }
+
+
+# DNS decoding
+	    if ($opt_l || $opt_dnsaudit) {
+		if (($PktUDP{src_port} == 53) || ($PktUDP{dst_port} == 53)) { # DNS Packets
+#		    &PrintDNS($PktIP{src_ip}, $PktUDP{data});  ################## add to $OutLine ###################
+		}
+	      }
+
+	    if ($opt_l) {
+#
+# BOOTP/DHCP Packets
+#
+		if ($opt_D && (($PktUDP{src_port} == 67) || ($PktUDP{dst_port} == 67) ||
+			       ($PktUDP{src_port} == 68) || ($PktUDP{dst_port} == 68))) {
+		    $PacketCountDHCP++;
+		    $DHCPserver_names{$PktIP{src_ip}}++ if ($PktUDP{src_port} == 67);
+		    if ($opt_v) {
+			&PrintDHCP($PktUDP{data});
+		    }
+		    return;
+		  }
+
+		if ($RegExp) {
+		  if ($PktUDP{data} =~ /$RegExp/o) {
+		    print "**** RegExp match: $RegExp *****\n";
+		    $RegExpMatchThisPacket++;
+		    $RegExpMatchCount++;
+		  }
+		}
+
+		$PktUDP{data} =~ s/\n/ /g;
+		$PktUDP{data} =~ s/[\x00-\x1f]//g;       # remove non-printable chars
+		$PktUDP{data} =~ s/[\x80-\xff]//g;       # 
+
+		if (length($PktUDP{data}) > 0) {  # Print only if we have something
+		    $OutLine .= "      $PktUDP{data}";
+
+		    if ($CaptureLength < $TotalLength) {
+			$OutLine .= '(...)';
+		    }
+		    $OutLine .= "\n";
+		}
+	    }
+
+	    if ($RegExp || $FilterModule) { # Selective packet printing
+	      print $OutLine if $RegExpMatchThisPacket;
+	    } else {
+	      print $OutLine;
+	    }
+	    return;
+	  }
+#
+# TCP Packet Decoding
+#
+	if ($PktIP{proto} eq '06') { # TCP
+	    ($PktTCP{src_port}, $PktTCP{dst_port}, $PktTCP{seqnum}, $PktTCP{acknum},
+	     $hlen_flags, $PktTCP{winsize}, $PktTCP{cksum}, $PktTCP{urg}, $rest2)
+		= unpack('n n  N N  n n  n n a*', $rest);
+
+	    $PktTCP{hlen} = 4 * ($hlen_flags >> 12);
+#	    $PktTCP{datalen} = $TotalLength - $PktIP{hlen} - $PktTCP{hlen} - $ETHER_HEAD_LENGTH;
+	    $PktTCP{datalen} = $PktIP{len} - $PktIP{hlen} - $PktTCP{hlen};
+
+	    $PktTCP{urg} = &SetBitVar($hlen_flags, 040);
+	    $PktTCP{ack} = &SetBitVar($hlen_flags, 020);
+	    $PktTCP{psh} = &SetBitVar($hlen_flags, 010);
+	    $PktTCP{rst} = &SetBitVar($hlen_flags,  04);
+	    $PktTCP{syn} = &SetBitVar($hlen_flags,  02);
+	    $PktTCP{fin} = &SetBitVar($hlen_flags,  01);
+
+	    $TrafficDirection = "$PktIP{src_ip}_$PktTCP{src_port} - $PktIP{dst_ip}_$PktTCP{dst_port}";
+
+
+# Identify multiple sessions, if we see them
+
+	    $SKey = &SessionKey("$PktIP{src_ip}_$PktTCP{src_port}", "$PktIP{dst_ip}_$PktTCP{dst_port}"); # Generate normalized session key
+	    $PktMeta{sessionkey} = $SKey;
+
+	    if ($PktTCP{syn} && !$PktTCP{ack}) {
+	      $BWsyns{$BWbinSecond}++ if $opt_b;;
+#	      print "New session: $SKey - $SessionPackets{$SKey}\n";
+	      if ($SessionPackets{$SKey} > 0) { # Repeat of src & dst IPs and ports
+		$ArchiveSKeys{$SKey}++;         # Make an "archive key" and move old data under it
+		$archive_skey = "$SKey-$ArchiveSKeys{$SKey}";
+		$SessionPackets{$archive_skey}   = $SessionPackets{$SKey};
+		$SessionBytes{$archive_skey}     = $SessionBytes{$SKey};
+		$SessionNumbers{$archive_skey}   = $SessionNumbers{$SKey};
+		$SessionStartTime{$archive_skey} = $SessionStartTime{$SKey};
+		$SessionEndTime{$archive_skey}   = $SessionEndTime{$SKey};
+		$SessionSynFin{$archive_skey}    = $SessionSynFin{$SKey};
+		if (exists $SessionDirection{$SKey}) {
+		  $SessionDirection{$archive_skey} = $SessionDirection{$SKey};
+		}
+
+		delete $SessionPackets{$SKey}; # Delete previous use of key
+		delete $SessionBytes{$SKey};
+		delete $SessionNumbers{$SKey};
+		delete $SessionStartTime{$SKey};
+		delete $SessionEndTime{$SKey};
+		delete $SessionSynFin{$SKey};
+		delete $SessionDirection{$SKey};
+	      }
+
+	      $SessionDirection{$SKey} = $TrafficDirection;
+	      $TCPwsf{$TrafficDirection} = 1;                # Window scale factor default if option not set
+
+	    }
+
+	    if (!exists $SessionPackets{$SKey}) {
+		$SessionNumber++;
+		$SessionID[$SessionNumber] = $SKey;
+		$SessionNumbers{$SKey} = $SessionNumber;
+		$PktTCP{session_num} = $SessionNumber;
+	    }
+	    $SessionPackets{$SKey}++;
+	    $SessionBytes{$SKey} += $TotalLength;
+#	    $SessionTime = $PktMeta{pkttime} - $FirstPacketTime - $TimeOffset;
+	    $sess_seq = "$SessionNumbers{$SKey}-$PktTCP{seqnum}"; # For re-transmit identification
+	    if ($PktTCP{datalen} > 0) {  # Don't count empty ACK pkts
+		if ($opt_b) {            # Collecting "bandwidth data"
+		  $BWretransmits{$BWbinSecond}++ if (exists $TCPseqNums{$sess_seq});
+		}
+		$TCPseqNums{$sess_seq}++;
+	    }
+#	    $TCPseqNumIDs{"$PktTCP{seqnum}-$PktIP{id}"}++;            # Count multiple copies of packets
+	    $TCPseqNumIDs{"$sess_seq-$PktIP{id}"}++ if $CountDupPkts; # Count multiple copies of packets
+
+
+	    if ($opt_v) {
+#		$PacketNotPrinted = 0;
+		$OutLine .= sprintf "%6d %s %s %4d",
+		$PacketCount, $fmtPacketTime, $EncapsulationFlag, $SessionNumbers{$SKey};
+
+		$OutLine .= sprintf " %16s %5s > %16s %5s",
+		$PktIP{src_ip}, $PktTCP{src_port}, $PktIP{dst_ip}, $PktTCP{dst_port};
+	    }
+
+#
+# Note presence of SYN, FIN, and RST, just report one SYN or FIN for each session
+# count first FIN or RST per time bin if we are tracking "bandwidth" (Initial SYNs are counted elsewhere for now)
+#
+	    if ($PktTCP{syn}) {
+	      $SessionSynFin{$SKey} = 'SYN ' unless $SessionSynFin{$SKey} =~ /SYN/;
+	    }
+
+	    if ($PktTCP{fin}) {
+	      $BWfin_rsts{$BWbinSecond}++ if ($opt_b && ($SessionSynFin{$SKey} !~ /FIN|RST/));
+	      $SessionSynFin{$SKey} .= 'FIN ' unless $SessionSynFin{$SKey} =~ /FIN/;
+	    }
+
+	    if ($PktTCP{rst}) {
+	      $BWfin_rsts{$BWbinSecond}++ if ($opt_b && ($SessionSynFin{$SKey} !~ /FIN|RST/));
+	      $SessionSynFin{$SKey} .= "RST($PktIP{src_ip}) "; # unless $SessionSynFin{$SKey} =~ /RST/;
+	    }
+
+#
+# Track time range in which we see a session's packets
+#
+	    if (!exists $SessionStartTime{$SKey}) {
+	      $SessionStartTime{$SKey} = $PktMeta{pkttime};
+	    }
+
+	    $SessionEndTime{$SKey} = $PktMeta{pkttime};
+
+	    $TCPoptions = '';
+	    if ($PktTCP{hlen} > 20) { # Have options
+	        $OptionsLength = $PktTCP{hlen} - 20;
+
+		$PktTCP{data} = substr($rest2, $OptionsLength, $PktTCP{datalen});
+
+		(@OptVals) = unpack("x20 C$OptionsLength", $rest);
+
+		for ($i = 0; $i <= $#OptVals; $i++) {
+		    $val = $OptVals[$i];
+
+		    if (($OptVals[$i] == 2) && ($OptVals[$i+1] == 4)) {
+			$PktTCP{mss} = 256 * $OptVals[$i+2] + $OptVals[$i+3];
+			$TCPoptions .= " MSS = $PktTCP{mss} ";
+			$i += 3;
+			$StartSeq{"$PktIP{src_ip}.$PktTCP{src_port} > $PktIP{dst_ip}.$PktTCP{dst_port}"} = $PktTCP{seqnum};
+			next;
+		    }
+
+		    if ($PktTCP{syn} && ($OptVals[$i] == 3) && ($OptVals[$i+1] == 3)) {
+			$WSF = $OptVals[$i+2];
+			$TCPoptions .= " WSF = $WSF ";
+			$PktTCP{wsf} =  $WSF;
+			$TCPwsf{$TrafficDirection} = 2 ** $WSF;
+			$i += 2;
+			next;
+		    }
+
+		    if (($OptVals[$i] == 8) && ($OptVals[$i+1] == 10)) {
+			$TCPoptions .= " Timstmps ";
+			$PktTCP{timestamps} = 1;
+			$i += 9;
+			next;
+		    }
+
+		}
+	    } else {
+		$PktTCP{data} = $rest2;
+	    }
+
+	    $PktTCP{rel_seqnum} = $PktTCP{seqnum} - $StartSeq{"$PktIP{src_ip}.$PktTCP{src_port} > $PktIP{dst_ip}.$PktTCP{dst_port}"};
+	    $PktTCP{rel_acknum} = $PktTCP{acknum} - $StartSeq{"$PktIP{dst_ip}.$PktTCP{dst_port} > $PktIP{src_ip}.$PktTCP{src_port}"};
+
+	    if ($opt_A) { # Show absolute sequence numbers
+		$seq = $PktTCP{seqnum};
+		$ack = $PktTCP{acknum};
+	    } else {      # Show "relative" sequence numbers
+		$seq = $PktTCP{rel_seqnum};
+		$ack = $PktTCP{rel_acknum};
+	    }
+
+	    if ($opt_v) {       # Save packet time for ACK time computation
+	      $fmtAckTime = ''; # Set value to blank
+	      $expected_ack_num = $PktTCP{seqnum} + $PktTCP{datalen};
+	      $SequenceTime{"$PktIP{src_ip}.$PktTCP{src_port}>$PktIP{dst_ip}.$PktTCP{dst_port}-$expected_ack_num"}
+		= $PktMeta{pkttime} if ($PktTCP{datalen} > 0);
+
+	      if ($PktTCP{ack}) {       # Compute ACK time
+		$seq_time_key = "$PktIP{dst_ip}.$PktTCP{dst_port}>$PktIP{src_ip}.$PktTCP{src_port}-$PktTCP{acknum}";
+		if ($SequenceTime{$seq_time_key}) {
+		  $ack_time = $PktMeta{pkttime} - $SequenceTime{$seq_time_key};
+		  $fmtAckTime = sprintf("%10.3f", $ack_time);
+		  delete $SequenceTime{$seq_time_key}; # Save memory, ignore multiple ACKs
+		}
+	      }
+
+	      $PktTCP{winsize} *= $TCPwsf{$TrafficDirection} unless $PktTCP{syn}; # Adjust for Window Scale Factor
+
+	      $OutLine .= sprintf " %10.0f %5d %5d %7.3f %10s %10.0f %10.0f",
+		$PktTCP{winsize}, $TotalLength, $PktTCP{datalen}, $DeltaTime,$fmtAckTime, $seq, $ack;
+	      $OutLine .= ' DF' if $PktIP{DF};
+	      $OutLine .= ' MF' if $PktIP{MF};
+	      if ($opt_F) {
+		$OutLine .= "  $FRInfo[$FRIindex]";
+		$OutLine .= "Not = $PktMeta{pkttime} $FRTimes[$FRIindex] "
+		  if ($PktMeta{pkttime} != $FRTimes[$FRIindex]); # For validation
+	      }
+	      $OutLine .= " $TCPoptions";
+	    }
+	    $TotalPacketBytes += $TotalLength;
+	    $TotalDataBytes += $PktTCP{datalen};
+
+	    $MD5val = 0;
+	    if ($ComputeMD5 && ($PktTCP{datalen} >= $MD5threshold)) {
+		$md5->reset();
+		$md5->add($PktTCP{data});
+		$MD5val = $md5->hexdigest;
+		$MD5count{$MD5val}++;
+		$MD5size{$MD5val} = length($PktTCP{data});
+		$MD5length{$MD5val} = $PktTCP{datalen};
+		$MD5packets{$MD5val} .= "$PacketCount ";
+	    }
+
+	    if ($opt_v || $opt_l) {
+
+		if ($opt_s) {
+		    $dt = $PktMeta{pkttime} - $FirstPrintedPacketTime;
+		    $OutLine .= sprintf " %7.3f", $dt;
+		}
+
+		$OutLine .= " URG " if $PktTCP{urg};
+		$OutLine .= " ACK " if $PktTCP{ack};
+		$OutLine .= " PSH " if $PktTCP{psh};
+		$OutLine .= " RST " if $PktTCP{rst};
+		$OutLine .= " SYN " if $PktTCP{syn};
+		$OutLine .= " FIN " if $PktTCP{fin};
+		if ($PktIP{tos}) {
+		    $OutLine .= sprintf "  TOS: %02x", $PktIP{tos};
+		}
+#		print " IPlen: $PktIP{len} ";
+		if ($MD5val) {
+		  $OutLine .= " $MD5val";
+		}
+		$sess_seq = "$SessionNumber-$PktTCP{seqnum}";
+		if ($TCPseqNums{$sess_seq} > 1) {
+		    $OutLine .= " ReTrans($TCPseqNums{$sess_seq})";
+		}
+		if ($ReceivedIPchecksum != 0) {
+		  $OutLine .= " Bad IP Checksum";
+		}
+		$OutLine .= "\n";
+#		print $OutLine;
+	    }
+
+	    if ($opt_G) {
+	      print PKTSUM "TCP-$SessionNumbers{$SKey} $PacketCount $PktMeta{pkttime} $TotalLength $PktIP{src_ip}_$PktTCP{src_port} $PktIP{dst_ip}_$PktTCP{dst_port}";
+	      if ($MD5val) {
+		print PKTSUM " $MD5val";
+	      }
+	      print PKTSUM "\n";
+	    }
+
+	    if ($opt_pktdb) {
+	      print PKTDB "TCP-$SessionNumbers{$SKey}|$PacketSeconds|$PacketMicroSeconds|$TotalLength|$PktIP{src_ip}|$PktTCP{src_port}|$PktIP{dst_ip}|$PktTCP{dst_port}|$PktTCP{winsize}|$PktTCP{seqnum}|$PktTCP{acknum}|";
+	      print PKTDB " URG " if $PktTCP{urg};
+	      print PKTDB " ACK " if $PktTCP{ack};
+	      print PKTDB " PSH " if $PktTCP{psh};
+	      print PKTDB " RST " if $PktTCP{rst};
+	      print PKTDB " SYN " if $PktTCP{syn};
+	      print PKTDB " FIN " if $PktTCP{fin};
+	      print PKTDB "\n";
+	    }
+
+	    if ($opt_S) { # SQL*net decode
+		($NSPHDLEN, $NSPHDPSM, $NSPHDTYP, $dummy, $NSPHDHSM) =
+		    unpack('n n  C C n', $PktTCP{data});
+		&SQLnetDecode($PktTCP{data});
+	    }
+
+	    $rest2 = $PktTCP{data};
+	    if ($PktTCP{datalen} <= 0) { # Clear garbage, if there is not supposed to be any data
+	      $rest2 = '';
+	    }
+
+	    if ($opt_E) { # Convert EBCDIC data
+	      $rest2 = &ebcdic2ascii($rest2);
+	    }
+
+	    if ($FilterModule) { # Send packet and metadata to the "Filter Module"
+	      $RegExpMatchThisPacket = &fmTCPpacket(\%PktHeader, \%PktMeta, \%PktLink, \%PktIP, \%PktTCP);
+	    }
+
+	    if ($RegExp) {
+	      if ($rest2 =~ /$RegExp/o) {
+		print "**** RegExp match: $RegExp *****\n";
+		$RegExpMatchThisPacket++;
+		$RegExpMatchCount++;
+		$RegExpMatchSession{$SessionNumbers{$SKey}}++;
+		$RegExpMatchSessionKey{$SessionNumbers{$SKey}} = $SKey;
+		$RegExpMatchPorts{$PktTCP{src_port}}++;
+		$RegExpMatchPorts{$PktTCP{dst_port}}++;
+	      }
+	    }
+
+	    if ($opt_l && ($PktTCP{datalen} > 0)) { # Print data from the last packet only if we have something
+
+	      $rest2 =~ s/[\x00-\x08]/\./g;       # remove non-printable chars
+	      $rest2 =~ s/[\x0b-\x0c]/\./g;       # leave \n & \t
+	      $rest2 =~ s/[\x0e-\x1f]/\./g;       # & \r
+	      $rest2 =~ s/[\x80-\xff]/\./g;
+
+	      $OutLine .= $rest2;
+	      print $rest2 if ($opt_l && !$opt_v); # Print payload now if -l set, but -v not
+	      if ($CaptureLength < $TotalLength) { # Indicate that we did not have the whole packet
+		$OutLine .= '(...)';
+	      }
+	      $OutLine .= "\n";
+	    }
+
+	    if ($opt_x) { # Print data in Hexadecimal
+	      $OutLine .= &PrintHex($PktTCP{data});
+	    }
+
+	    if ($opt_P) { # Collect data for plots
+
+		$PlotData{"$PktIP{src_ip}_$PktTCP{src_port} > $PktIP{dst_ip}_$PktTCP{dst_port}"} .= sprintf "%.4f %d\n",
+		$PktMeta{pkttime} - $FirstPacketTime, $TotalLength;
+
+	    }
+
+# Record TCP packet data by session and direction
+	    $direction = "$PktIP{src_ip}_$PktTCP{src_port} > $PktIP{dst_ip}_$PktTCP{dst_port}"; # Which way the packets are flowing
+	    $PacketDirection{$direction}++;
+	    if ($direction eq $LastPacketDirection) {
+		$BackToBackPackets{$direction}++;
+	    }
+	    $LastPacketDirection = $direction;
+
+	    if ($opt_w) { # Write data to files
+		&WriteData($opt_w, $direction, $PktTCP{data});
+	    }
+
+	    $FullSizePackets{$direction}++ if ($TotalLength >= $MaxPacketSize);
+	    $TotalBytesByDirection{$direction} += $TotalLength;
+
+	}
+
+
+	if ($opt_v && $PacketNotPrinted) { # Not previously printed
+	  if (length($OutLine) == 0) {     # If we did not get anything yet
+	    # Need to fix session time above
+	    $OutLine .= sprintf "%6d %s %s ", $PacketCount, $fmtPacketTime, $EncapsulationFlag;
+	    $OutLine .= sprintf "%4s", $ip_type_name{$PktIP{proto}};
+	    $OutLine .= sprintf " %16s %5s > %16s %5s", $PktIP{src_ip}, $PktTCP{src_port}, $PktIP{dst_ip}, $PktTCP{dst_port};
+	    $OutLine .= sprintf "       %5d       %7.3f", $TotalLength, $DeltaTime;
+	    $OutLine .= '                                      ';
+	    if ($opt_F) {
+	      $OutLine .= " $FRInfo[$FRIindex]";
+	    }
+	    if ($ReceivedIPchecksum != 0) {
+	      $OutLine .= " Bad IP Checksum";
+	    }
+
+	    $OutLine .= ' Fragment' if $MoreFragments{$PktIP{id}};
+	    $OutLine .= "\n";
+	  }
+
+	  if ($RegExp || $FilterModule) { # Selective packet printing
+	    print $OutLine if $RegExpMatchThisPacket;
+	  } else {
+	    print $OutLine if $opt_v;
+#	    print $rest2 if ($opt_l && !$optv);
+	  }
+	}
+
+      # Clear fragment counter
+      #
+        delete $MoreFragments{$PktIP{id}} if ((exists $MoreFragments{$PktIP{id}}) && (!$PktIP{MF}));
+
+	return;
+    }
+
+#
+# Get anything missed above, need to add -v printing
+#
+    $fmt_proto = ($ethertype_name{$PktLink{ether_type}} ? $ethertype_name{$PktLink{ether_type}} : $PktLink{ether_type} );
+    $fmt_proto .= '-' . ($ip_type_name{$PktIP{proto}} ? $ip_type_name{$PktIP{proto}} : $PktIP{proto} );
+
+    $PacketsByProto{$fmt_proto}++;
+    $BytesByProto{$fmt_proto} += $TotalLength;
+
+    if ($FilterModule) { # Send packet and metadata to the "Filter Module"
+      $RegExpMatchThisPacket = &fmOTHERpacket(\%PktHeader, \%PktMeta, \%PktLink);
+    }
+
+    # Clear fragment counter
+    #
+    delete $MoreFragments{$PktIP{id}} if ((exists $MoreFragments{$PktIP{id}}) && (!$PktIP{MF}));
+
+}
+
+sub SessionKey { # Should handle ports ==
+    my ($a, $b) = @_;
+    my ($ip, $p_a, $p_b);
+
+    ($ip, $p_a) = split(/_/, $a);
+    ($ip, $p_b) = split(/_/, $b);
+
+    if ($p_a > $p_b) {
+	return "$a - $b";
+    } else {
+	return "$b - $a";
+    }
+}
+
+
+sub FirstMD5PacketNum {
+#    my ($a, $b) = @_;
+    my ($p1, $p2, $rest);
+
+    ($p1, $rest) = split(' ', $MD5packets{$a}, 2);
+    ($p2, $rest) = split(' ', $MD5packets{$b}, 2);
+
+#    print "Sort $a $b $p1 $p2\n";
+
+    if ($p1 > $p2) {
+	return 1;
+    } elsif ($p1 == $p2) { # This could never happen, unless
+	return 0;
+    } else {
+	return -1;
+    }
+}
+
+sub SetBitVar {
+    my ($data, $mask) = @_;
+    my $result;
+
+    $result = $data & $mask;
+
+    if ($result == 0) {
+	return 0;
+    } else {
+	return 1;
+    }
+}
+
+sub PrintDNS {
+    my ($From) = shift; # Source IP address
+    my ($data) = shift; # Packet payload
+
+    my ($ID, $Flags, $NumQuest, $NumAnsRRs, $NumAuthRRs, $NumAddRRs, $rest);
+    my ($DNS_qa, $byte_count, $q_portion, $Question);
+    my ($QR, $opcode, $AA, $TC, $RD, $RAzero, $rcode);
+    my ($QT, $QC);
+
+    $DNSpacketCount++;
+
+    if ($HaveNetDNS) {
+
+      $Question = '';
+      $packet = new Net::DNS::Packet(\$data);
+      if (defined $packet) { # Decode the DNS packet, not all of this is currently used
+	#      print $packet->string;
+	$header = $packet->header;
+	@question = $packet->question;
+	@answer = $packet->answer;
+	@authority = $packet->authority;
+	@additional = $packet->additional; # list of `Net::DNS::RR' objects
+
+	$ID = $header->id;
+	$QR = $header->qr;
+	$opcode = $header->opcode;
+	$AA = $header->aa;
+	$rcode = $header->rcode;
+
+	foreach $q (@question) {
+	  $qs = $q->string;
+	  $qs =~ s/IN//;   # Don't need to see IN
+	  $qs =~ s/\s+/ /g; # Remove excess whitespace
+	  $Question .= $qs . ' ';
+#	  print "$PacketCount  $qs\n";
+	}
+      }
+
+    } else {			# No DNS Module, we'll do crude decoding
+print "No DNS Module\n";
+      ($ID, $Flags, $NumQuest, $NumAnsRRs, $NumAuthRRs, $NumAddRRs, $rest)
+	= unpack ('n n n n n n a*', $data);
+
+      $DNS_qa = $rest;
+      print "DNS: $ID, $Flags, Nq: $NumQuest  Nans: $NumAnsRRs  Nauth: $NumAuthRRs  Naddr: $NumAddRRs\n" if $opt_l;
+
+      ($pFlags) = pack('n', $Flags);
+      $B = unpack('B16', $pFlags);
+      ($QR, $opcode, $AA, $TC, $RD, $RAzero, $rcode) =
+	unpack('B H B B B H H', $pFlags);
+
+      do {
+	($byte_count, $rest) = unpack('c a*', $rest);
+	if ($byte_count > 0) {
+	  ($q_portion, $rest) = unpack("a$byte_count a*", $rest);
+	  $Question .= $q_portion . '.';
+	}
+      } until ( ($byte_count <= 0) or (length($rest) <= 0) );
+      ($QT, $QC) = unpack('n n', $rest);
+    }
+
+    if ($QR == 0) {		# Question
+      $DNSquestionCount++;
+      $DNSquestionAnswered{$ID} = 0;
+      $DNSquestion{$ID} = $Question;
+      $DNSquerytime{$ID} = $PktMeta{pkttime};
+      $DNSqueryFromIP{$ID} = $From;
+      print "Question: opcode: $opcode  AA: $AA  TC: $TC  RD: $RD  RAz  $RAzero  rcode: $rcode QT: $QT $QC  $Question\n" if $opt_l;
+
+    }
+
+    if ($QR == 1) {		# Answer
+      $DNSanswerCount++;
+      print "Answer: opcode: $opcode  AA: $AA  TC: $TC  RD: $RD  RAz  $RAzero  rcode: $rcode  $Question\n" if $opt_l;
+      if (exists $DNSquerytime{$ID}) {
+	$dt = $PktMeta{pkttime} - $DNSquerytime{$ID};
+	print "Answer to $DNSquestion{$ID} in $dt\n" if $opt_l;
+	$DNSquestionAnswered{$ID}++;
+	$DNSresponseStat->add_data($dt) if $HaveStatistics;
+
+	#	delete $DNSquestion{$ID};
+	#	delete $DNSquerytime{$ID};
+      } else {
+#	print "Answer only: $PacketCount  $Question  opcode: $opcode  AA: $AA  TC: $TC  RD: $RD  RAz  $RAzero  rcode: $rcode \n";
+	$DNSanswerNoQueryTime{$ID} = $PktMeta{pkttime};
+	$DNSanswerNoQueryQuestion{$ID} = "$Question $rcode";
+	$DNSqueryFromIP{$ID} = $From;
+	# $DNSanswerNoQueryPacket{$ID} = $packet;
+      }
+    }
+  }
+
+sub PrintDHCP {
+
+    my ($data) = @_;
+
+    my ($op, $htype, $hlen, $hops, $xid, $secs, $flags, $ciaddr, $yiaddr);
+    my ($siaddr, $giaddr, $chaddr, $sname, $file, $options);
+    my ($m1, $m2, $m3, $m4, $c1, $l1, $opt_code, $opt_len, $i, @val);
+    my ($str_val, $int_val, $tmp);
+
+    ($op, $htype, $hlen, $hops, $xid, $secs, $flags, $ciaddr, $yiaddr,
+     $siaddr, $giaddr, $chaddr, $sname, $file, $m1, $m2, $m3, $m4, $options)
+	= unpack ('c c c c N n n N N N N A16 A64 A128 C C C C a*', $data);
+
+# op  htype hlen  hops xid  secs  flags ciaddr yiaddr siaddr giaddr chaddr sname file options
+
+    $Aciaddr = &dotquad($ciaddr);
+    $Ayiaddr = &dotquad($yiaddr);
+#    $Asiaddr = &dotquad($siaddr);
+#    $Agiaddr = &dotquad($giaddr);
+
+#    print "$op  $htype  $hlen  $hops  $xid  $secs  $flags  $ciaddr  $yiaddr\n";
+#    print " $siaddr  $giaddr  $chaddr  Sname: $sname  File: $file\n";
+
+    print "        XID: $xid  $op  $secs s  yiaddr: $Ayiaddr  ciaddr: $Aciaddr\n";
+    while (length($options) > 0) { # Unpack options field
+#	($opt_code, $opt_len, $options) = unpack ('C C a*', $options);
+	($opt_code, $options) = unpack ('C a*', $options);
+	next if ($opt_code == 0); # Padding byte, no length or data
+	last if ($opt_code == 255); # Indicates end-of-options
+
+	($opt_len, $options) = unpack ('C a*', $options);
+
+	print "        $DHCP_code[$opt_code] ($opt_code): ";
+	
+	if ($op == 1) {
+	    $DHCPxid_request{$xid}++;
+	}
+	if ($op == 2) {
+	    $DHCPxid_reply{$xid}++;
+	}
+
+	if ($DHCP_code_type[$opt_code] eq 'string') {
+	    ($str_val, $tmp) = unpack ("A$opt_len a*", $options);
+	    print " (string: $str_val) ";
+	    if ($opt_code == 12) { # Look for unanswered requests by hostname
+		$str_val = uc $str_val;
+		if ($op == 1) {
+		    $DHCPrequest{$str_val}++;
+		    $DHCPxid_request_by_node{$str_val} = $xid;
+		}
+		if ($op == 2) {
+		    $DHCPreply{$str_val}++;
+		}
+	    }
+	} elsif  ($DHCP_code_type[$opt_code] eq 'N') {
+	    ($int_val, $tmp) = unpack ("N a*", $options);
+	    print " (int: $int_val) ";
+	}
+
+	(@val) = unpack ("C$opt_len a*", $options);
+
+	for ($i = 0; $i < $#val; $i++) {
+	    if ($opt_code == 53) {
+		print "$DHCP_message_type[$val[0]]";
+		last;
+
+#	    } elsif ($DHCP_code_type[$opt_code] eq 'string') {
+#		print chr($val[$i]);
+
+#	    } elsif ($opt_code == 12) {
+#		print chr($val[$i]);
+
+	    } else {
+		print " $val[$i]";
+	    }
+	}
+	print "\n";
+	$options = $val[$#val];
+    }
+
+}
+
+
+sub WriteData {
+    my ($dir, $filename, $data) = @_;
+
+    $filename =~ s/\s+//g; # Don't want spaces in filenames
+    $filename =~ s/>/-/g;
+    do {
+	print "Opening $dir/$filename\n";
+
+	my $FH= new FileHandle;
+	$WF{$filename} = $FH;
+
+	open($WF{$filename}, ">$dir/$filename")
+	    || warn "Can't open  $dir/$filename";
+    } unless ($WF{$filename});
+
+    $FH = $WF{$filename};
+
+    print $FH $data;
+
+}
+
+sub PrintHex { # Taken from xdump (Camel Book 1st Ed)
+  my ($data_in) = @_;
+
+  my ($pos, $total_length, $offset, $len, $out_data);
+
+  $out_data = '';
+  $total_length = length($data_in);
+  $pos = 0;
+
+  # Do it optimally as long as we can read 16 bytes at a time.
+
+  while ($pos < $total_length) {
+    $data = substr($data_in, $pos, 16);
+    @array = unpack('N4', $data);
+    $data =~ tr/\0-\37\177-\377/./;
+    $out_data .= sprintf "%8.8lx %8d   %8.8lx %8.8lx %8.8lx %8.8lx    %s\n",
+    $offset, $offset, @array, $data;
+    $offset += 16;
+    $pos += 16;
+    last if (($total_length - $pos) < 16);
+  }
+
+  # Now finish up the end a byte at a time.
+
+  if (($total_length - $pos) > 0) {
+    $data = substr($data_in, $pos, 16);
+
+    @array = unpack('C*', $data);
+    $data =~ y/\0-\37\177-\377/./;
+    for (@array) {
+      $len++;
+      $_ = sprintf('%2.2x',$_);
+    }
+    push(@array, '  ') while $len++ < 16;
+    $data =~ s/[^ -~]/./g;
+    $out_data .= sprintf "%8.8lx %8d   ", $offset, $offset;
+    $out_data .= sprintf "%s%s%s%s %s%s%s%s %s%s%s%s %s%s%s%s    %s\n",
+    @array, $data;
+  }
+  return $out_data;
+}
+
+
+#-----------------------------------------------------------------------
+
+sub dotquad {
+    my ( $net ) = @_ ;
+    $na=$net >> 24 & 255 ;
+    $nb=$net >> 16 & 255 ;
+    $nc=$net >>  8 & 255 ;
+    $nd=$net & 255 ;
+    return ( "$na.$nb.$nc.$nd") ;
+}
+#-----------------------------------------------------------------------
+
+sub checksum {    # Taken from NET::Ping
+  my ($msg) = @_; # The message to checksum
+  my ($len_msg,	  # Length of the message
+      $num_short, # The number of short words in the message
+      $short,	  # One short word
+      $chk	  # The checksum
+     );
+
+  $len_msg = length($msg);
+  $num_short = $len_msg / 2;
+  $chk = 0;
+  foreach $short (unpack("S$num_short", $msg)) {
+    $chk += $short;
+  }				# Add the odd byte in
+  $chk += unpack("C", substr($msg, $len_msg - 1, 1)) if $len_msg % 2;
+  $chk = ($chk >> 16) + ($chk & 0xffff); # Fold high into low
+  return(~(($chk >> 16) + $chk) & 0xffff); # Again and complement
+}
+
+
+sub ISO8601 {     # Convert UNIX seconds to ISO format date & time
+  my ($time) = @_;
+  my ($sec, $min, $hour, $day, $mon, $year,
+      $wday, $yday, $isdat, $isodate);
+  ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdat)
+    = localtime($time);
+  #      = gmtime($time);
+  $mon++;                       # month is zero-based
+  $year += 1900;
+  $isodate = sprintf("%04d-%02d-%02dT%02d:%02d:%02d",
+                     $year, $mon, $day, $hour, $min, $sec);
+}
+
+
+
+__END__
+
+
+$PktHeader{magic}
+$PktHeader{version_major}
+$PktHeader{version_minor}
+$PktHeader{thiszone}
+$PktHeader{sigfigs}
+$PktHeader{snaplen}
+$PktHeader{linktype}
+
+$FileStartTime $PktHeader{file_start_time}
+
+$Seconds $PktMeta{tv_sec}
+$uSeconds $PktMeta{tv_usec}
+$CaptureLength $PktMeta{caplen}
+$TotalLength $PktMeta{len}
+$PktMeta{pktnum}
+$PacketTime $PktMeta{pkttime}
+$SKey $PktMeta{sessionkey}
+
+$ether_dst $PktLink{ether_dest}
+$ether_src $PktLink{ether_src}
+$ether_type_or_length $PktLink{ether_type_or_length}
+$ether_type $PktLink{ether_type}
+
+$ver $PktIP{ver}
+$IPheadlength $PktIP{hlen}
+$PktIP{flags}
+$PktIP{foffset}
+$IPtos $PktIP{tos}
+$IPlength $PktIP{len}
+$IPid $PktIP{id}
+$ttl $PktIP{ttl}
+$proto $PktIP{proto}
+$cksum $PktIP{cksum}
+$From $PktIP{src_ip}
+$To $PktIP{dst_ip}
+$PktIP{options}
+$PktIP{data}
+
+$ICMPtype $PktICMP{type}
+$ICMPcode $PktICMP{code}
+$cksum $PktICMP{cksum}
+$rest2 $PktICMP{data}
+
+$SrcPort $PktUDP{src_port}
+$DstPort $PktUDP{dst_port}
+$UDPlength $PktUDP{len}
+$cksum $PktUDP{cksum}
+$rest2 $PktUDP{data}
+$udp_data_length $PktUDP{datalen}
+
+$SrcPort $PktTCP{src_port}
+$DstPort $PktTCP{dst_port}
+$SeqNum $PktTCP{seqnum}
+$AckNum $PktTCP{acknum}
+$TCPheadlength $PktTCP{hlen}
+$PktTCP{reserved}
+$PktTCP{flags}
+$WindowSize $PktTCP{winsize}
+$cksum $PktTCP{cksum}
+$urgent_pnt $PktTCP{urg}
+$PktTCP{options}
+$TCPdata $PktTCP{data}
+
+$URG $PktTCP{urg}
+$ACK $PktTCP{ack}
+$PSH $PktTCP{psh}
+$RST $PktTCP{rst}
+$SYN $PktTCP{syn}
+$FIN $PktTCP{fin}
+$DataLength $PktTCP{datalen}
+$SessionNumber $PktTCP{session_num}
+$MSS $PktTCP{mss}
+$WSF $PktTCP{wsf}
+$PktTCP{timestamps}
+
+
